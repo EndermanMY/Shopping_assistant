@@ -1,0 +1,71 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>Local mock shop · testing only</title></head><body>
+<script>window._itemOnly = (__PRODUCT__); window.appointmentData = {"yuyue": __RESERVATION__};</script>
+<main id="root">正在加载</main>
+<script>
+const cfg = __CONFIG__;
+const stage = new URL(location.href).searchParams.get('stage') || 'product';
+const root = document.querySelector('#root');
+const sku = '100327520619';
+const name = '雷鸟 GT Max bilibili 限定版 M码';
+if (stage === 'product') {
+ root.innerHTML = `<span style="display:none">立即预约</span><h1>${name}</h1><p class="nickname">Test account</p><p id="reservation-status">${cfg.captcha ? '请完成安全验证' : cfg.needReservation ? '预约中' : '已预约抢购资格'}</p><p>预约 开始抢购</p>${cfg.needReservation&&!cfg.modernReminder?'<button id="reserve">立即预约</button>':''}${cfg.modernReminder?'<div class="page-right-RightBtns"><div class="first-row has-second-row">已设置开抢提醒</div><div>明天10:00开抢</div></div>':''}`;
+ root.insertAdjacentHTML('beforeend','<button data-testid="add-cart" id="add-cart">加入购物车</button>');
+ document.querySelector('#add-cart').onclick=async()=>{await fetch('/add-cart');root.insertAdjacentHTML('beforeend','<p>已加入购物车</p>');};
+ if(cfg.needReservation&&!cfg.modernReminder) document.querySelector('#reserve').onclick=async()=>{await fetch('/reserve');document.querySelector('#reservation-status').textContent='预约成功';};
+}
+if (stage === 'cart') {
+ const locked = Date.now() < cfg.unlockAt;
+ root.innerHTML = `<h1>购物车</h1>${cfg.inCart?`<section><input aria-label="目标商品" type="checkbox" ${locked?'disabled':''}><a href="https://item.jd.com/${sku}.html">${name}</a><input aria-label="商品数量" value="${cfg.cartQuantity||1}"></section>`:''}<section><input aria-label="其他商品" type="checkbox" checked><a href="https://item.jd.com/100000000001.html">Other product</a></section><button id="settle">去结算 (1)</button>`;
+ if(cfg.splitCart){
+  const section=root.querySelector('section');
+  const quantity=`<input min="1" max="54" value="${cfg.cartQuantity||1}" ${cfg.lockedQuantity?'disabled':''} ${cfg.quantityDelayMs?'style="display:none"':''}>`;
+  section.outerHTML=`<div data-rowgid="fixture-target"><div class="_rowItem_test"><div class="_good-info_test"><input aria-label="目标商品" type="checkbox" ${locked?'disabled':''}><a href="https://item.jd.com/${sku}.html">${name}</a><input aria-label="商品备注" value="不要修改"></div></div><div class="_rowItem_test"><div class="_cart-number_test">${quantity}${cfg.duplicateQuantity?quantity:''}</div></div></div>`;
+  if(cfg.quantityDelayMs)setTimeout(()=>root.querySelector('._cart-number_test input').style.display='',cfg.quantityDelayMs);
+ }
+ document.querySelectorAll('input').forEach(el => el.addEventListener('change', () => document.querySelector('#settle').textContent = `去结算 (${document.querySelectorAll('input:checked').length})`));
+ if(cfg.asyncCart){
+  root.insertAdjacentHTML('afterbegin','<input type="checkbox" aria-label="店铺" checked>');
+  document.querySelectorAll('section input').forEach(el=>el.onclick=e=>{
+   const desired=el.checked;e.preventDefault();
+   root.insertAdjacentHTML('beforeend','<div id="global-loading" style="position:fixed;inset:0;background:#ddd8">正在加载</div>');
+   setTimeout(()=>{el.checked=desired;document.querySelector('#global-loading').remove();document.querySelector('#settle').textContent=`去结算 (${document.querySelectorAll('section input:checked').length})`;},180);
+  });
+  document.querySelector('[aria-label="店铺"]').onclick=()=>{throw new Error('Must not toggle cascading store checkbox');};
+ }
+ const qty=document.querySelector('[aria-label="商品数量"], ._cart-number_test input');if(qty)qty.onchange=()=>fetch('/cart-quantity?value='+qty.value);
+ document.querySelector('#settle').onclick = async () => {
+   const selected = [...document.querySelectorAll('section,[data-rowgid]')].filter(el => el.querySelector('input').checked).map(el => el.querySelector('a').href.match(/\/(\d+)\.html/)[1]);
+   await fetch('/checkout-check?selected=' + selected.join(','));
+   location.href='/?stage=checkout';
+ };
+}
+if (stage === 'checkout') {
+ root.innerHTML = `<h1>确认订单</h1><div data-testid="checkout-goods"><a href="https://item.jd.com/${cfg.wrongSku?'999999999999':sku}.html">${name}</a><span data-testid="quantity">${cfg.quantity || 1}</span></div><p data-testid="shipping-address">${cfg.wrongAddress?'别的小区':'测试小区'}</p><strong data-testid="total">${cfg.unknownPrice?'待发布':'¥ '+(cfg.total/100).toFixed(2)}</strong><button data-testid="submit-order">提交订单</button>`;
+ if(cfg.modernCheckout){
+  root.innerHTML=`<div class="sku-item"><div class="title-test"><div class="ellipsis-test">${name}</div></div><div class="quantity-test">0.56kg×${cfg.quantity||1}</div></div><div class="consignee-item-test active-test">${cfg.wrongAddress?'别的小区':'测试小区'}</div><div class="consignee-item-test">测试小区</div><div class="payment-action"><div class="payment-action-total"><div class="priceInfo"><span class="price">${cfg.unknownPrice?'待发布':(cfg.total/100).toFixed(2)}</span></div></div><button class="btn-primary">打白条</button></div><div class="modePaymentLi-test"><span>京东白条</span><label><input type="checkbox" checked></label></div><div class="modePaymentLi-test"><span>微信支付</span><label><input type="checkbox"></label></div>`;
+  root.querySelector('.title-test').onclick=()=>window.open(`https://item.jd.com/${cfg.wrongSku?'999999999999':sku}.html`);
+  root.querySelectorAll('.modePaymentLi-test input').forEach(box=>box.onchange=()=>{root.querySelectorAll('.modePaymentLi-test input').forEach(other=>{if(other!==box)other.checked=false;});root.querySelector('button').textContent=box.closest('.modePaymentLi-test').textContent.includes('微信')?'立即支付':'打白条';});
+ }
+ document.querySelector('button').onclick=async () => {
+  await fetch('/submit');
+  if(cfg.modernCheckout){
+   if(cfg.paymentDelayMs)await new Promise(r=>setTimeout(r,cfg.paymentDelayMs));
+   await fetch('/payment-enter');
+   root.insertAdjacentHTML('beforeend',`<div class="scantoPay-test"><div class="scantoPayHead-test">微信支付${cfg.paymentOrderId?` 订单号：${cfg.paymentOrderId}`:''}${cfg.missingPaymentClose?'':'<img class="close-test" alt="关闭本次支付" src="data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' width=\'20\' height=\'20\'%3E%3Crect width=\'20\' height=\'20\'/%3E%3C/svg%3E">'}</div><p>微信APP扫码支付</p><button id="cancel-order">取消订单</button></div>`);
+   document.querySelector('#cancel-order').onclick=()=>fetch('/cancel-order');
+   const close=document.querySelector('.close-test');if(close)close.onclick=async()=>{await fetch('/payment-exit');document.querySelector('.scantoPay-test').remove();};
+  }else if(!cfg.lostResponse){root.insertAdjacentHTML('beforeend','<p>订单提交成功</p><button id="go-pay">去付款</button>');document.querySelector('#go-pay').onclick=()=>location.href='/?stage=payment';}
+ };
+}
+if(stage==='payment'){
+ fetch('/payment-enter');
+ root.innerHTML='<div data-testid="payment-cashier"><h1>微信支付</h1><p>请使用微信扫一扫 扫描二维码支付</p><button data-testid="payment-exit">取消支付</button><button id="cancel-order">取消订单</button></div>';
+ root.querySelector('[data-testid="payment-exit"]').onclick=async()=>{await fetch('/payment-exit');location.href='/?stage=orders';};
+ root.querySelector('#cancel-order').onclick=()=>fetch('/cancel-order');
+}
+if (stage === 'orders') {
+ fetch('/orders').then(r=>r.json()).then(orders => {
+  root.innerHTML=orders.length?orders.map(o=>cfg.modernOrders ? `<article class="orderCard-test"><div class="orderMetas-test">订单号<div>${o.id}</div></div><a href="https://item.jd.com/${sku}.html">${name}</a><span class="countNum-test">1</span><time class="orderTime-test">${o.time}</time><span class="priceRow-test">¥ ${(cfg.total/100).toFixed(2)}</span><p>等待付款</p></article>` : `<article data-order-id="${o.id}"><a href="https://item.jd.com/${sku}.html">${name}</a><span data-testid="quantity">1</span><time data-testid="order-time">${o.time}</time><span data-testid="order-total">¥ ${(cfg.total/100).toFixed(2)}</span><p>等待付款</p></article>`).join(''):'暂无订单';
+ });
+}
+</script></body></html>
