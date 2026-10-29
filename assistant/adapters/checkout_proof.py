@@ -47,7 +47,7 @@ class CheckoutProof:
     @staticmethod
     def config_key(config):
         return (config.product.sku, config.product.spec, config.quantity,
-                config.max_total_cents, config.address_hint, config.ignore_price, config.skip_checks)
+                config.max_total_cents, config.address_hint, config.ignore_price, config.skip_checks, config.use_api)
 
     @classmethod
     async def capture(cls, page, selectors, config):

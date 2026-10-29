@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 CHINA = ZoneInfo("Asia/Shanghai")
 
@@ -55,7 +55,7 @@ class TaskConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     product: Product
     quantity: int = Field(default=1, ge=1, le=1)
-    submit_mode: Literal['dom'] = 'dom'
+    use_api: bool = Field(default=False, strict=True)
     scheduled_at: datetime
     advance_ms: int = Field(default=0, ge=0, le=86_400_000, strict=True)
     max_total_cents: int | None = Field(default=None, gt=0, le=100_000_000)
@@ -72,11 +72,21 @@ class TaskConfig(BaseModel):
             raise ValueError('请填写用于核对的收货地址关键字')
         return self
 
-    @field_validator('submit_mode', mode='before')
+    @model_validator(mode='before')
     @classmethod
     def migrate_legacy_api_mode(cls, value):
-        # Existing API task records remain readable, but main always clicks.
-        return 'dom' if value == 'api' else value
+        if isinstance(value, dict):
+            value = dict(value)
+            legacy = value.pop('submit_mode', 'dom')
+            if legacy not in ('dom','api'):
+                raise ValueError('提交方式必须是 dom 或 api')
+        # Old API branch settings alone never activate the new option.
+        return value
+
+    @computed_field
+    @property
+    def submit_mode(self) -> Literal['dom','api']:
+        return 'api' if self.use_api else 'dom'
 
     def price_allowed(self, total: int | None) -> bool:
         return self.skip_checks or self.ignore_price or (total is not None and self.max_total_cents is not None

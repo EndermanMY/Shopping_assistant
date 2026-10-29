@@ -16,6 +16,8 @@ from playwright.async_api import expect, TimeoutError as PlaywrightTimeoutError
 from ..models import CHINA, Checkout, NeedsHuman, NotReady, OrderResult, Product, TaskConfig
 from ..protection import AccessLimited, check_access, check_page_access
 from .jd_api import SubmitProbe
+from .jd_api import SubmitSignal
+from .jd_submit_bridge import PageSignedSubmit
 from .checkout_proof import CheckoutProof
 
 
@@ -244,6 +246,9 @@ class JDAdapter:
         self.checkout_proof = None
         self.checked_checkout = None
         self.skip_checks = False
+        self.before_dispatch = None
+        self.api_bridge = None
+        self.api_signal = SubmitSignal()
 
     async def _wait_product_ready(self):
         # Text locators can pick an earlier hidden promotion element. Wait on
@@ -766,8 +771,7 @@ class JDAdapter:
             raise NeedsHuman("尚未到实际抢购开始时间，未提交订单")
         # Revalidate immediately before the irreversible click.
         await self._guard()
-        if not config.skip_checks:
-            await self.recheck_checkout(config)
+        checked = await self.recheck_checkout(config)
         button = self.page.locator(SELECTORS["submit"])
         visible = [el for el in await button.all() if await el.is_visible()]
         if len(visible) != 1 or not await visible[0].is_enabled():
@@ -785,11 +789,35 @@ class JDAdapter:
             raise NeedsHuman("本场次提交窗口已结束，未执行提交")
         self.submitted_at = datetime.now(CHINA)
         self.payment_pages_before = set((await self.browser.ensure()).pages)
+        if self.before_dispatch is not None:
+            self.before_dispatch()
+        if config.use_api:
+            if not manual_qr or self.before_dispatch is None:
+                raise NeedsHuman('API 提交要求手动扫码付款和持久提交记录，未派发请求')
+            self.api_bridge = PageSignedSubmit(self.browser, self.page, self.before_dispatch, self._api_order)
+            try:
+                self.api_signal = await self.api_bridge.submit(config, checked, visible[0], self._api_recheck)
+            except Exception:
+                if self.api_bridge.forwarded == 0:
+                    self.api_signal = SubmitSignal('rejected')
+                raise
+            finally:
+                if self.on_diagnostic is not None:
+                    self.on_diagnostic(f'API 提交：实际派发 {self.api_bridge.forwarded} 次，HTTP {self.api_bridge.status or "未确认"}；不会切换通道重复提交')
+            return
         # Observe the request emitted by this exact click. Never send/replay a
         # second request, even when the browser or server response is unclear.
         self.submit_probe = SubmitProbe(self.browser, self.page, self._api_order)
         self.submit_probe.start()
         await visible[0].click(timeout=10000)
+
+    async def _api_recheck(self, config):
+        if config.skip_checks:
+            # The SDK already accepted this unique click. Its own loading
+            # indicator may disable the button while the request is held.
+            await self._guard()
+            return Checkout(sku=config.product.sku,quantity=config.quantity,total_cents=None,address='未核对')
+        return await self.recheck_checkout(config)
 
     def _api_order(self, order_id):
         self.expected_order_id = order_id
@@ -800,6 +828,8 @@ class JDAdapter:
         if self.checkout_proof is not None:
             await self.checkout_proof.close()
             self.checkout_proof = None
+        if self.api_bridge is not None:
+            await self.api_bridge.close()
         if self.submit_probe is not None:
             await self.submit_probe.close()
             if self.on_diagnostic is not None:
@@ -814,6 +844,8 @@ class JDAdapter:
         deadline = time.monotonic()+self.payment_wait_seconds
         opened = False
         while time.monotonic() < deadline:
+            if self.api_signal.kind == 'rejected':
+                raise NeedsHuman('API 提交未成功，转为订单核对；不会切回页面重复提交')
             if self.submit_probe is not None:
                 self.submit_probe.check()
             candidates = [self.page]+[p for p in context.pages if p not in self.payment_pages_before and p is not self.page]

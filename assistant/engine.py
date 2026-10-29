@@ -100,6 +100,19 @@ class Engine:
                     self.log(task_id, f"提交 API 已返回候选订单号 {order_id}，正在核验；尚未报告成功")
                 adapter.on_submit_order = capture_order
                 adapter.on_diagnostic = lambda message: self.log(task_id, message)
+            if hasattr(adapter, 'before_dispatch'):
+                def before_dispatch():
+                    current = self.store.get(task_id)
+                    if not current or not current['submit_intent']:
+                        raise NeedsHuman('提交记录未持久化，未派发订单请求')
+                    if self.stop_event.is_set():
+                        raise NeedsHuman('任务已停止，未派发订单请求')
+                    end = config.purchase_end
+                    if config.product.sale_end and not config.skip_checks:
+                        end = min(end, datetime.fromisoformat(config.product.sale_end))
+                    if not config.purchase_start <= self.now() < end or self.monotonic() >= monotonic_end:
+                        raise NeedsHuman('已不在本场次执行窗口，未派发订单请求')
+                adapter.before_dispatch = before_dispatch
             if stored["submit_intent"]:
                 self.state(task_id, Status.VERIFYING, "检测到历史提交记录，先核对订单，禁止自动重复提交")
                 since = datetime.fromisoformat(stored["submitted_at"]) if stored.get("submitted_at") else config.scheduled_at
@@ -110,6 +123,7 @@ class Engine:
                 self.log(task_id, '无需条件核对模式已开启：跳过预约资格、商品、数量、地址和金额核对；仍按设定时间仅提交一次，付款手动完成', 'warning')
             elif config.ignore_price:
                 self.log(task_id, '此任务已开启无视价格下单：不检查应付金额或预算上限；付款仍由你手动完成', 'warning')
+            self.log(task_id, '本任务使用 API 提交，结果不明时不切换通道重试' if config.use_api else '本任务使用页面提交')
             fresh = await adapter.prepare(config)
             if not config.skip_checks and fresh.sale_start and abs((datetime.fromisoformat(fresh.sale_start) - config.scheduled_at).total_seconds()) > 2:
                 raise NeedsHuman("商品最新开售时间与任务场次不一致，请更新任务后启动")
