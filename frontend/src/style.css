@@ -12,3 +12,7 @@
 @media(max-width:380px){.content-aside{grid-template-columns:1fr}.task-toolbar{flex-wrap:wrap}.tabs{flex:1}.search{margin:2px 0 12px;width:100%}.task-state{max-width:calc(100% - 120px)}}
 
 .panel-controls{display:flex;align-items:center;gap:12px;flex-shrink:0}.timing-preview{font-size:12px;line-height:1.8;background:#f7f5ff;color:#6554a4;padding:12px;border-radius:8px;overflow-wrap:anywhere}.deleted-task{display:flex;align-items:center;gap:12px;padding:14px 0;border-bottom:1px solid #eee}.deleted-task>div{flex:1;min-width:0;overflow-wrap:anywhere}.deleted-task strong{font-size:13px}.deleted-task p{font-size:11px;color:#8f92a0}.detail-grid dd{overflow-wrap:anywhere}@media(max-width:600px){.panel-controls{gap:6px}.panel-controls .text-button{font-size:10px}.task-actions{gap:3px}.panel-heading{gap:8px}}
+
+.reset-confirm{display:flex;align-items:flex-start;gap:10px;margin:20px 0;line-height:1.6}.reset-confirm input{width:18px;min-width:18px;height:18px;margin-top:4px;accent-color:var(--primary,#7257ff)}
+
+.task-actions{flex-wrap:wrap;flex-shrink:0}
