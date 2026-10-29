@@ -64,7 +64,7 @@ def create_app(data: Path | None = None, adapter_factory=None):
         await browser.close()
         store.close()
 
-    app = FastAPI(title="购物小助手", version="0.1.3", lifespan=lifespan,
+    app = FastAPI(title="购物小助手", version="0.2.0", lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store, app.state.access = store, access
     app.state.browser, app.state.engine = browser, engine
@@ -92,7 +92,7 @@ def create_app(data: Path | None = None, adapter_factory=None):
 
     @app.get("/api/health")
     async def health():
-        return {"ok": True, "version": "0.1.3"}
+        return {"ok": True, "version": "0.2.0"}
 
     @app.post("/api/auth/login")
     async def login(body: Login, request: Request, response: Response):
