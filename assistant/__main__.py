@@ -9,7 +9,7 @@ from .app import ROOT, create_app, lan_ips
 
 
 def main():
-    port = int(os.environ.get("SHOPPING_PORT", "18765"))
+    port = int(os.environ.get("SHOPPING_PORT", "18766"))
     # Check before constructing SQLite/browser resources, so a second launch
     # cannot mark the live instance's running tasks as interrupted.
     probe = socket.socket()

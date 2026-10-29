@@ -40,7 +40,7 @@ def field_names(value, prefix='', depth=0):
 
 
 async def main():
-    data = ROOT/'data'
+    data = ROOT/'data-api'
     browser = Browser(data)
     record = {'sku':'100285622568', 'checked_at':datetime.now(CHINA).isoformat(),
               'order_submit_blocked':0, 'read_api_attempted':False, 'tasks_changed':False,
@@ -155,6 +155,7 @@ async def main():
             await asyncio.gather(*list(jobs), return_exceptions=True)
         await browser.close()
         target = data/'qa'/'jd-api-readonly-20261029.json'
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding='utf-8')
         print(json.dumps(record, ensure_ascii=True), flush=True)
 

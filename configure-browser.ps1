@@ -1,7 +1,7 @@
 param([ValidateSet('system','direct')][string]$Network = 'system')
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
-$dataRoot = if ($env:SHOPPING_DATA_DIR) { $env:SHOPPING_DATA_DIR } else { Join-Path $PSScriptRoot 'data' }
+$dataRoot = if ($env:SHOPPING_DATA_DIR) { $env:SHOPPING_DATA_DIR } else { Join-Path $PSScriptRoot 'data-api' }
 New-Item -ItemType Directory -Force -Path $dataRoot | Out-Null
 $settingsPath = Join-Path $dataRoot 'browser-network.json'
 $profileName = 'jd'

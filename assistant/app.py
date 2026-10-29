@@ -51,7 +51,7 @@ def lan_ips():
 
 
 def create_app(data: Path | None = None, adapter_factory=None):
-    data = data or Path(os.environ.get("SHOPPING_DATA_DIR", ROOT / "data"))
+    data = data or Path(os.environ.get("SHOPPING_DATA_DIR", ROOT / "data-api"))
     data.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(ROOT / "data" / "browsers"))
     store, access, browser = Store(data / "assistant.db"), Access(data), Browser(data)
@@ -64,7 +64,7 @@ def create_app(data: Path | None = None, adapter_factory=None):
         await browser.close()
         store.close()
 
-    app = FastAPI(title="购物小助手", version="0.1.2", lifespan=lifespan,
+    app = FastAPI(title="购物小助手", version="0.2.0-api.1", lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store, app.state.access = store, access
     app.state.browser, app.state.engine = browser, engine
@@ -92,7 +92,7 @@ def create_app(data: Path | None = None, adapter_factory=None):
 
     @app.get("/api/health")
     async def health():
-        return {"ok": True, "version": "0.1.2"}
+        return {"ok": True, "version": "0.2.0-api.1"}
 
     @app.post("/api/auth/login")
     async def login(body: Login, request: Request, response: Response):
@@ -110,7 +110,7 @@ def create_app(data: Path | None = None, adapter_factory=None):
 
     @app.get("/api/overview")
     async def overview():
-        port = int(os.environ.get("SHOPPING_PORT", "18765"))
+        port = int(os.environ.get("SHOPPING_PORT", "18766"))
         return {"tasks": store.tasks(), "events": store.events(), "account": await browser.status(),
                 "lan_urls": [f"http://{ip}:{port}" for ip in lan_ips()],
                 "busy_task": engine.task_id if engine.busy else None,
