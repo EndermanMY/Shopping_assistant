@@ -1,4 +1,4 @@
-param([string]$Version = '0.1.3-dev', [switch]$SkipTests)
+param([string]$Version = '0.1.3', [switch]$SkipTests)
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 $python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'

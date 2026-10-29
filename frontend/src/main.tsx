@@ -215,7 +215,7 @@ const expired = () => { setAuthenticated(false); setOverview(null); };
           <section className="panel phone-panel"><div className="phone-symbol"><Smartphone size={26} /><span><Wifi size={13} /></span></div><h3>电脑执行，手机掌握</h3><p>连接同一 Wi-Fi，用 iPhone 随时查看进度、处理任务。</p><button className="text-button" onClick={() => setModal('connect')}>连接手机控制台 <ArrowUpRight size={15} /></button></section>
           <div className="local-time"><span className="status-dot green" />电脑时间 · {stamp(new Date(clock).toISOString())}<span>Asia / Shanghai</span></div>
         </aside></div>
-        <footer className="page-footer"><span>购物小助手 <i />让每一次准备，都有条不紊。</span><span>主分支页面提交 · v0.1.3-dev</span></footer>
+        <footer className="page-footer"><span>购物小助手 <i />让每一次准备，都有条不紊。</span><span>主分支页面提交 · v0.1.3</span></footer>
       </main>
     </div>
     {notice && <div className="toast" role="status"><Bell size={17} /><span>{notice}</span><button aria-label="关闭提示" onClick={() => setNotice('')}><X size={15} /></button></div>}
