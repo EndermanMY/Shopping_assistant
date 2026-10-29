@@ -64,3 +64,13 @@ async def test_api_cors_preflight_is_not_mistaken_for_a_second_order():
     route=SimpleNamespace(request=request,abort=AsyncMock(),fallback=AsyncMock())
     await bridge._handle(route);route.fallback.assert_awaited_once();route.abort.assert_not_awaited()
     assert bridge.forwarded==0
+
+
+async def test_submit_named_function_cannot_pass_the_readonly_prefix_allowlist():
+    bridge=PageSignedSubmit(None,SimpleNamespace(main_frame=object()),lambda:None)
+    bridge.future=asyncio.get_running_loop().create_future()
+    request=SimpleNamespace(url='https://api.m.jd.com/api?functionId=balance_getSubmitOrder_pc',method='POST')
+    route=SimpleNamespace(request=request,abort=AsyncMock(),fallback=AsyncMock())
+    await bridge._handle(route)
+    route.abort.assert_awaited_once();route.fallback.assert_not_awaited()
+    assert bridge.future.exception() is not None

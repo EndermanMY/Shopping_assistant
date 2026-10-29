@@ -101,7 +101,7 @@ class PageSignedSubmit:
                 self.forwarded += 1
                 return await route.fallback()
         # Only audited read functions can proceed during/after preparation.
-        if (parsed.scheme == 'https' and parsed.hostname == 'api.m.jd.com' and parsed.path == '/api'
+        if (not looks_submit and parsed.scheme == 'https' and parsed.hostname == 'api.m.jd.com' and parsed.path == '/api'
                 and parsed.port in (None,443) and len(functions) == 1
                 and re.fullmatch(r'balance_get[A-Za-z0-9_]+|balance_success_pc|pctradesoa_getWareGrow', functions[0])):
             return await route.fallback()
