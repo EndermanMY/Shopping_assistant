@@ -635,7 +635,7 @@ class JDAdapter:
 
     async def read_checkout(self, config: TaskConfig, *, allow_pending_price=False) -> Checkout:
         proof = await CheckoutProof.capture(self.page,
-            [SELECTORS[key] for key in ('goods','total','address')]+['[class*="modePaymentLi-"]'], config)
+            [SELECTORS[key] for key in (('goods','address') if config.ignore_price else ('goods','total','address'))]+['[class*="modePaymentLi-"]'], config)
         try:
             checked = await self._read_checkout_fields(config, allow_pending_price=allow_pending_price)
             if not await proof.matches(config):
@@ -707,23 +707,25 @@ class JDAdapter:
                     amounts.append(int(match.group(1)))
             if not amounts or sum(amounts) != config.quantity:
                 raise NeedsHuman("结算数量无法确认或与任务不符，已暂停提交")
-        totals = set()
-        for item in await self.page.locator(SELECTORS["total"]).all():
-            if await item.is_visible():
-                label = await item.inner_text()
-                try:
-                    totals.add(money_cents(label))
-                except NeedsHuman:
-                    if allow_pending_price and re.search('待发布|待公布|暂无价格|开售后', label):
-                        raise NotReady('开售前应付价格尚未公布') from None
-                    raise
-        if len(totals) != 1:
-            raise NeedsHuman("应付总额未知或存在歧义，请检查结算页")
-        total = totals.pop()
+        total = None
+        if not config.ignore_price:
+            totals = set()
+            for item in await self.page.locator(SELECTORS["total"]).all():
+                if await item.is_visible():
+                    label = await item.inner_text()
+                    try:
+                        totals.add(money_cents(label))
+                    except NeedsHuman:
+                        if allow_pending_price and re.search('待发布|待公布|暂无价格|开售后', label):
+                            raise NotReady('开售前应付价格尚未公布') from None
+                        raise
+            if len(totals) != 1:
+                raise NeedsHuman("应付总额未知或存在歧义，请检查结算页")
+            total = totals.pop()
         addresses = [await el.inner_text() for el in await self.page.locator(SELECTORS["address"]).all() if await el.is_visible()]
         if not any(compact(config.address_hint) in compact(address) for address in addresses):
             raise NeedsHuman("选中的收货地址与任务关键字不符，已暂停提交")
-        if total <= 0 or total > config.max_total_cents:
+        if not config.price_allowed(total):
             raise NeedsHuman(f"应付总额 ¥{total / 100:.2f} 超过上限或无效，已暂停提交")
         await self.check_manual_payment()
         return Checkout(sku=config.product.sku, quantity=sum(amounts), total_cents=total, address="已核对")
@@ -972,7 +974,7 @@ class JDAdapter:
                 if (not sku_ids and config is not None and since is not None and stamp is not None and pending
                     and id_match.group(1) not in (baseline or [])
                     and since - timedelta(seconds=5) <= stamp <= datetime.now(CHINA) + timedelta(seconds=5)
-                    and total is not None and 0 < total <= config.max_total_cents):
+                    and config.price_allowed(total)):
                     before = page.url
                     sku_ids = await self._detail_skus(card, page, id_match.group(1))
                     navigated = page.url != before
@@ -1008,7 +1010,7 @@ class JDAdapter:
                            and o["skus"] == {config.product.sku} and o["pending"]
                            and o["quantity"] == config.quantity
                            and o["stamp"] and since - timedelta(seconds=5) <= o["stamp"] <= datetime.now(CHINA) + timedelta(seconds=5)
-                           and o["total"] is not None and 0 < o["total"] <= config.max_total_cents]
+                           and config.price_allowed(o['total'])]
                 if len(matches) == 1:
                     order = matches[0]
                     message = "锁单成功，待付款；已进入并退出扫码支付" if self.payment_flow == "entered_and_exited" else "锁单成功，待付款；已核对订单号和目标商品"

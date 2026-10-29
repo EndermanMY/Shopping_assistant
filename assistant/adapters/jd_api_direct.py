@@ -46,7 +46,7 @@ class DirectSubmitTrial:
         if checkout != prepared.checkout or self.page.url != prepared.page_url:
             raise NeedsHuman('结算页或订单条件发生变化，未发送 API 请求')
         if (checkout.sku != config.product.sku or checkout.quantity != config.quantity
-                or checkout.address != '已核对' or not 0 < checkout.total_cents <= config.max_total_cents):
+                or checkout.address != '已核对' or not config.price_allowed(checkout.total_cents)):
             raise NeedsHuman('API 提交前商品、数量、地址或金额校验失败')
         end = min(config.purchase_end, datetime.fromisoformat(config.product.sale_end)) if config.product.sale_end else config.purchase_end
         if not config.purchase_start <= self.now() < end:

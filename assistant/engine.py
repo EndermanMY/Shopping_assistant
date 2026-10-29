@@ -118,6 +118,8 @@ class Engine:
                 result = await adapter.verify(config, stored["baseline"] or [], since=since)
                 self.finish(task_id, result)
                 return
+            if config.ignore_price:
+                self.log(task_id, '此任务已开启无视价格下单：不检查应付金额或预算上限；付款仍由你手动完成', 'warning')
             fresh = await adapter.prepare(config)
             if fresh.sale_start and abs((datetime.fromisoformat(fresh.sale_start) - config.scheduled_at).total_seconds()) > 2:
                 raise NeedsHuman("商品最新开售时间与任务场次不一致，请更新任务后启动")
@@ -141,7 +143,8 @@ class Engine:
                 self.log(task_id, f"结算预检查计划：{config.checkout_prepare_at.isoformat(timespec='milliseconds')} 开始，目标 {config.checkout_ready_by.isoformat(timespec='milliseconds')} 前完成；只准备，不提交")
                 await self.wait_for_start(config.checkout_prepare_at)
                 if self.now() < config.purchase_start:
-                    self.state(task_id, Status.PRECHECKING, "正在提前核对结算商品、数量、地址和金额；尚未提交")
+                    checks = '商品、数量和地址（已开启无视价格）' if config.ignore_price else '商品、数量、地址和金额'
+                    self.state(task_id, Status.PRECHECKING, f"正在提前核对结算{checks}；尚未提交")
                     try:
                         await adapter.prepare_checkout(config)
                         self.state(task_id, Status.SCHEDULED, "结算页核验已完成，等待实际抢购时间提交")
@@ -168,7 +171,7 @@ class Engine:
                     checkout_ms = round((self.monotonic() - checkout_started) * 1000)
                     if checkout.sku != config.product.sku or checkout.quantity != config.quantity:
                         raise NeedsHuman("结算商品或数量不符")
-                    if checkout.total_cents <= 0 or checkout.total_cents > config.max_total_cents:
+                    if not config.price_allowed(checkout.total_cents):
                         raise NeedsHuman("结算金额超过上限或无法确认")
                     if self.stop_event.is_set():
                         raise asyncio.CancelledError
@@ -179,7 +182,8 @@ class Engine:
                     # Durable intent MUST be written before clicking. Even if
                     # the process dies at the next instruction, recovery only
                     # verifies and never blindly submits again.
-                    self.state(task_id, Status.SUBMITTING, f"商品、数量、地址和金额已核对（本次结算检查 {checkout_ms} 毫秒），正在提交一次订单",
+                    checks = '商品、数量和地址已核对；无视价格下单已开启' if config.ignore_price else '商品、数量、地址和金额已核对'
+                    self.state(task_id, Status.SUBMITTING, f"{checks}（本次结算检查 {checkout_ms} 毫秒），正在提交一次订单",
                                submit_intent=uuid.uuid4().hex, submitted_at=self.now().isoformat())
                     submit_started = self.monotonic()
                     try:
@@ -231,11 +235,12 @@ class Engine:
         if result.outcome == 'created' and stored.get('submission_order_id') and result.order_id != stored['submission_order_id']:
             result = OrderResult(outcome='unknown', order_id=stored['submission_order_id'], message='提交 API 订单号与订单列表不一致，请人工核对；不会重复提交')
         if result.outcome == "created" and (not result.order_id or result.sku != config.product.sku
-                or result.total_cents is None or not 0 < result.total_cents <= config.max_total_cents):
+                or not config.price_allowed(result.total_cents)):
             result = OrderResult(outcome="unknown", message="缺少明确订单号、匹配商品或金额证据，请人工核对")
         if result.outcome == "created" and result.payment_entered:
             suffix = "；支付退出状态需人工核对" if result.payment_flow == "not_confirmed" else ""
-            result = result.model_copy(update={"message": f"抢购成功，锁单成功！订单号：{result.order_id}，待付款 ¥{result.total_cents / 100:.2f}" + suffix})
+            payable = f'待付款 ¥{result.total_cents / 100:.2f}' if result.total_cents is not None else '待付款，金额以京东订单为准'
+            result = result.model_copy(update={"message": f"抢购成功，锁单成功！订单号：{result.order_id}，{payable}" + suffix})
             status = Status.SUCCEEDED
         elif result.outcome == "created":
             result = result.model_copy(update={"message": f"已创建订单 {result.order_id}，但未确认进入付款界面，请人工核对；不会再次提交"})
