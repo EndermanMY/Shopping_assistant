@@ -254,6 +254,25 @@ async def test_cashier_order_id_must_match_created_order(store, config, mock_sho
     assert state['submits']==1
 
 
+async def test_cashier_rendered_after_body_snapshot_still_provides_order_id(config, mock_shop, browser_harness, tmp_path, monkeypatch):
+    import assistant.adapters.jd as jd
+    state, origin = mock_shop
+    adapter = JDAdapter(browser_harness, tmp_path)
+    adapter.page = await browser_harness.task_page()
+    await adapter.page.goto(origin+'/?stage=checkout')
+    original_check = jd.check_page_access
+
+    async def show_after_snapshot(browser, page):
+        text = await original_check(browser, page)
+        await page.locator('body').evaluate("""n => n.insertAdjacentHTML('beforeend',
+            '<div class="scantoPay-test"><div class="scantoPayHead-test">微信支付 订单号：999999999999</div><p>微信APP扫码支付</p></div>')""")
+        return text
+
+    monkeypatch.setattr(jd, 'check_page_access', show_after_snapshot)
+    assert await adapter.enter_payment(config) == '999999999999'
+    assert adapter.payment_entered and state['submits'] == 0
+
+
 async def test_async_cart_selection_ignores_store_checkbox(store, config, mock_shop, browser_harness, tmp_path):
     mock_shop[0]["asyncCart"] = True
     task, _ = await run_shop(store, config, mock_shop, browser_harness, tmp_path)
@@ -686,11 +705,10 @@ async def test_opt_in_api_price_change_after_sdk_preparation_sends_no_request(st
     context = await browser_harness.ensure()
     calls = await api_task_backend(context, state, store)
     class Changed(JDAdapter):
-        reads = 0
-        async def read_checkout(self, cfg):
-            self.reads += 1
-            checked = await super().read_checkout(cfg)
-            return checked.model_copy(update={'total_cents':checked.total_cents+1}) if self.reads >= 3 else checked
+        async def recheck_checkout(self, cfg, **kwargs):
+            if self.api_bridge is not None and self.api_bridge.held is not None:
+                await self.page.locator('.price').evaluate("n => n.textContent = '999999.00'")
+            return await super().recheck_checkout(cfg, **kwargs)
     adapter = Changed(browser_harness,tmp_path,JDUrls(product=origin+'/?stage=product&sku={sku}',cart=origin+'/?stage=cart',orders=origin+'/?stage=orders'))
     engine = Engine(store,lambda:adapter)
     config = config.model_copy(update={'submit_mode':'api','scheduled_at':datetime.now(CHINA)-timedelta(milliseconds=1),'window_seconds':30})
@@ -719,12 +737,10 @@ async def test_opt_in_api_stop_before_dispatch_blocks_the_wire(store, config, mo
     state.update(modernCheckout=True, submitApi='balance_submitOrder_pc', sdkXHR=True)
     calls = await api_task_backend(await browser_harness.ensure(), state, store)
     class Stopped(JDAdapter):
-        reads = 0
-        async def read_checkout(self, cfg):
-            result = await super().read_checkout(cfg)
-            self.reads += 1
-            if self.reads >= 3: engine.stop_event.set()
-            return result
+        async def recheck_checkout(self, cfg, **kwargs):
+            if self.api_bridge is not None and self.api_bridge.held is not None:
+                engine.stop_event.set()
+            return await super().recheck_checkout(cfg, **kwargs)
     adapter = Stopped(browser_harness,tmp_path,JDUrls(product=origin+'/?stage=product&sku={sku}',cart=origin+'/?stage=cart',orders=origin+'/?stage=orders'))
     engine = Engine(store,lambda:adapter)
     config = config.model_copy(update={'submit_mode':'api','scheduled_at':datetime.now(CHINA)-timedelta(milliseconds=1),'window_seconds':30})

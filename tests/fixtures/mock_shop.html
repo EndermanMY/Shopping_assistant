@@ -47,6 +47,7 @@ if (stage === 'checkout') {
   root.querySelectorAll('.modePaymentLi-test input').forEach(box=>box.onchange=()=>{root.querySelectorAll('.modePaymentLi-test input').forEach(other=>{if(other!==box)other.checked=false;});root.querySelector('button').textContent=box.closest('.modePaymentLi-test').textContent.includes('微信')?'立即支付':'打白条';});
  }
  document.querySelector('button').onclick=async () => {
+  if(cfg.sdkButtonBusy){document.querySelector('button').disabled=true;document.querySelector('button').classList.add('loading');}
   if(cfg.submitApi){
    const apiUrl='https://api.m.jd.com/api?functionId='+(typeof cfg.submitApi==='string'?cfg.submitApi:'pc_trade_submitOrder');
    const response=cfg.sdkXHR?await new Promise((resolve,reject)=>{
