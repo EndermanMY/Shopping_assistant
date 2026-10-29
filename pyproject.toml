@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shopping-assistant"
-version = "0.2.0a2"
+version = "0.2.0a3"
 description = "Local, single-account shopping assistant with a JD adapter"
 requires-python = ">=3.12"
 dependencies = [
