@@ -2,6 +2,7 @@ import json
 import asyncio
 import threading
 import time
+import random
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -44,6 +45,7 @@ def mock_shop(config):
                 state[path.path] = state.get(path.path, 0) + 1
                 raw, content = b"ok", "text/plain"
             elif path.path == "/orders":
+                state['orderReads'] = state.get('orderReads', 0)+1
                 raw, content = json.dumps([] if state.get("hideOrders") else state["orders"]).encode(), "application/json"
             elif path.path == "/checkout-check":
                 state["selection"] = parse_qs(path.query)["selected"][0]
@@ -67,7 +69,14 @@ def mock_shop(config):
             self.send_header("Content-Length",str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
-    server = ThreadingHTTPServer(("127.0.0.1",0),Handler)
+    for _ in range(100):
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1",random.randrange(20000,60000)),Handler)
+            break
+        except OSError:
+            continue
+    else:
+        raise RuntimeError('No safe local mock shop port available')
     thread = threading.Thread(target=server.serve_forever,daemon=True)
     thread.start()
     yield state, f"http://127.0.0.1:{server.server_port}"
@@ -89,6 +98,11 @@ async def browser_harness(request, tmp_path):
         else:
             chromium = await playwright.chromium.launch(headless=True)
             context = await chromium.new_context()
+        # All JD hosts used by fixtures stay offline. Individual tests can
+        # register newer routes for intentional delay/error scenarios.
+        await context.route('https://item.jd.com/**', lambda route:route.fulfill(body='<p>Offline SKU detail</p>'))
+        await context.route('https://item.m.jd.com/**', lambda route:route.fulfill(body='<p>Offline SKU detail</p>'))
+        await context.route('https://api.m.jd.com/**', lambda route:route.abort('blockedbyclient'))
         class Harness:
             async def ensure(self):
                 return context
@@ -603,3 +617,127 @@ async def test_direct_api_trial_runs_native_fetch_once_in_real_browser(config, m
     with pytest.raises(NeedsHuman):
         await client.submit(config, prepared, adapter.read_checkout)
     assert len(calls) == 1
+
+
+async def api_task_backend(context, state, store, *, status=200, drop=False):
+    requests = []
+    async def handle(route):
+        if route.request.method == 'OPTIONS':
+            origin = route.request.headers.get('origin', '')
+            return await route.fulfill(status=204, headers={'Access-Control-Allow-Origin':origin,
+                'Access-Control-Allow-Credentials':'true','Access-Control-Allow-Methods':'POST',
+                'Access-Control-Allow-Headers':'content-type'})
+        assert store.tasks()[0]['submit_intent']
+        requests.append(route.request)
+        if status == 200:
+            state['submits'] += 1
+            state['orders'].append({'id':'123456789013','time':datetime.now(CHINA).strftime('%Y-%m-%d %H:%M:%S')})
+        if drop:
+            return await route.abort('connectionreset')
+        origin = route.request.headers.get('origin', '')
+        await route.fulfill(status=status, headers={'Content-Type':'application/json',
+            'Access-Control-Allow-Origin':origin, 'Access-Control-Allow-Credentials':'true'},
+            body=json.dumps({'code':'0','body':{'resultFlag':True,'order':{'orderIdStr':'123456789013'}}}
+                            if status == 200 else {'code':'error'}))
+    await context.route('https://api.m.jd.com/api?*', handle)
+    return requests
+
+
+@pytest.mark.parametrize('browser_harness', ['persistent','native_cdp'], indirect=True)
+async def test_opt_in_api_task_uses_fresh_sdk_request_and_only_one_actual_post(store, config, mock_shop, browser_harness, tmp_path):
+    state, _ = mock_shop
+    state.update(modernCheckout=True, submitApi='balance_submitOrder_pc', sdkXHR=True)
+    calls = await api_task_backend(await browser_harness.ensure(), state, store)
+    config = config.model_copy(update={'submit_mode':'api'})
+    task, _ = await run_shop(store, config, mock_shop, browser_harness, tmp_path)
+    assert task['status'] == Status.SUCCEEDED, task['message']
+    assert len(calls) == state['submits'] == 1
+    assert task['submission_order_id'] == '123456789013'
+    assert task['result']['payment_entered']
+    assert any('实际派发 1 次' in e['message'] for e in store.events(task['id']))
+
+
+async def test_opt_in_api_disconnect_keeps_guard_and_resume_never_dispatches_again(store, config, mock_shop, browser_harness, tmp_path):
+    from assistant.browser import Browser
+    state, _ = mock_shop
+    state.update(modernCheckout=True, submitApi='balance_submitOrder_pc', sdkXHR=True, paymentWaitSeconds=.2)
+    context = await browser_harness.ensure()
+    calls = await api_task_backend(context, state, store, drop=True)
+    config = config.model_copy(update={'submit_mode':'api'})
+    task, engine = await run_shop(store, config, mock_shop, browser_harness, tmp_path)
+    assert len(calls) == state['submits'] == 1
+    assert task['status'] == Status.WAITING
+    # The page SDK (or a repeated click) cannot send another order after error.
+    guarded = next(p for p in context.pages if getattr(p, '_api_submit_guarded', False))
+    await guarded.evaluate("fetch('https://api.m.jd.com/api?functionId=balance_submitOrder_pc',{method:'POST',body:'fixture-only'}).catch(()=>{})")
+    assert len(calls) == 1
+    engine.start(task['id'], resume=True)
+    await engine.job
+    assert len(calls) == 1
+    # Future tasks use a fresh page, rather than disabling the old retry guard.
+    browser = Browser(tmp_path)
+    browser.context, browser.page = context, guarded
+    assert await browser.task_page() is not guarded
+
+
+async def test_opt_in_api_price_change_after_sdk_preparation_sends_no_request(store, config, mock_shop, browser_harness, tmp_path):
+    state, origin = mock_shop
+    state.update(modernCheckout=True, submitApi='balance_submitOrder_pc', sdkXHR=True)
+    context = await browser_harness.ensure()
+    calls = await api_task_backend(context, state, store)
+    class Changed(JDAdapter):
+        reads = 0
+        async def read_checkout(self, cfg):
+            self.reads += 1
+            checked = await super().read_checkout(cfg)
+            return checked.model_copy(update={'total_cents':checked.total_cents+1}) if self.reads >= 3 else checked
+    adapter = Changed(browser_harness,tmp_path,JDUrls(product=origin+'/?stage=product&sku={sku}',cart=origin+'/?stage=cart',orders=origin+'/?stage=orders'))
+    engine = Engine(store,lambda:adapter)
+    config = config.model_copy(update={'submit_mode':'api','scheduled_at':datetime.now(CHINA)-timedelta(milliseconds=1),'window_seconds':30})
+    task = store.create(config)
+    engine.start(task['id']); await engine.job
+    assert not calls and not state['submits']
+    assert store.get(task['id'])['status'] == Status.WAITING
+
+
+async def test_opt_in_api_429_pauses_without_post_submit_order_queries(store, config, mock_shop, browser_harness, tmp_path):
+    from assistant.protection import AccessProtection
+    state, _ = mock_shop
+    state.update(modernCheckout=True, submitApi='balance_submitOrder_pc', sdkXHR=True)
+    browser_harness.protection = AccessProtection(tmp_path)
+    calls = await api_task_backend(await browser_harness.ensure(), state, store, status=429)
+    config = config.model_copy(update={'submit_mode':'api'})
+    task, _ = await run_shop(store, config, mock_shop, browser_harness, tmp_path)
+    assert len(calls) == 1 and state['submits'] == 0
+    assert browser_harness.protection.state()['paused']
+    assert state['orderReads'] == 1  # Only the pre-submit baseline was read.
+    assert task['status'] == Status.WAITING
+
+
+async def test_opt_in_api_stop_before_dispatch_blocks_the_wire(store, config, mock_shop, browser_harness, tmp_path):
+    state, origin = mock_shop
+    state.update(modernCheckout=True, submitApi='balance_submitOrder_pc', sdkXHR=True)
+    calls = await api_task_backend(await browser_harness.ensure(), state, store)
+    class Stopped(JDAdapter):
+        reads = 0
+        async def read_checkout(self, cfg):
+            result = await super().read_checkout(cfg)
+            self.reads += 1
+            if self.reads >= 3: engine.stop_event.set()
+            return result
+    adapter = Stopped(browser_harness,tmp_path,JDUrls(product=origin+'/?stage=product&sku={sku}',cart=origin+'/?stage=cart',orders=origin+'/?stage=orders'))
+    engine = Engine(store,lambda:adapter)
+    config = config.model_copy(update={'submit_mode':'api','scheduled_at':datetime.now(CHINA)-timedelta(milliseconds=1),'window_seconds':30})
+    task=store.create(config);engine.start(task['id']);await engine.job
+    assert not calls and state['submits'] == 0
+    assert store.get(task['id'])['submit_intent']
+
+
+async def test_opt_in_api_unsupported_sdk_never_falls_back_to_network(store, config, mock_shop, browser_harness, tmp_path):
+    state, _ = mock_shop
+    state.update(modernCheckout=True, submitApi='balance_submitOrder_pc')  # fetch SDK not calibrated
+    calls = await api_task_backend(await browser_harness.ensure(), state, store)
+    config = config.model_copy(update={'submit_mode':'api'})
+    task, _ = await run_shop(store, config, mock_shop, browser_harness, tmp_path)
+    assert not calls and state['submits'] == 0
+    assert task['status'] == Status.WAITING

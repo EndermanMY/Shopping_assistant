@@ -7,6 +7,7 @@ import json
 import socket
 import threading
 import time
+import random
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -23,7 +24,16 @@ from tests.test_core import FakeAdapter
 def console_server(tmp_path):
     app = create_app(tmp_path, adapter_factory=FakeAdapter)
     sock = socket.socket()
-    sock.bind(("127.0.0.1",0))
+    # Windows may allocate low ephemeral ports such as 6669, which Chromium
+    # deliberately rejects. Keep browser test servers in a safe high range.
+    for _ in range(100):
+        try:
+            sock.bind(("127.0.0.1",random.randrange(20000,60000)))
+            break
+        except OSError:
+            continue
+    else:
+        raise RuntimeError('No safe local browser test port available')
     port = sock.getsockname()[1]
     sock.close()
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error", access_log=False))
@@ -265,4 +275,26 @@ async def test_api_candidate_order_is_shown_without_success_or_reset(console_ser
         await expect(page.get_by_role('button',name='重置到抢购前',exact=True)).to_have_count(0)
         assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
         assert not app.state.engine.busy
+        await browser.close()
+
+
+async def test_mobile_can_save_api_choice_without_starting_a_task(console_server, config):
+    app, origin = console_server
+    future = config.model_copy(update={'scheduled_at':datetime.now(CHINA)+timedelta(minutes=10)})
+    task = app.state.store.create(future)
+    async with async_playwright() as pw:
+        browser=await pw.chromium.launch();page=await browser.new_page(viewport={'width':375,'height':900})
+        await page.goto(origin)
+        await page.get_by_label('控制台访问码').fill(app.state.access.code)
+        await page.get_by_role('button',name='连接工作台').click()
+        await page.get_by_role('button',name=f'查看任务 {config.product.sku}').click()
+        await page.get_by_role('button',name='修改配置',exact=True).click()
+        mode=page.get_by_label('提交方式',exact=True)
+        await expect(mode).to_have_value('dom')
+        await mode.select_option('api')
+        await page.get_by_role('button',name='保存任务',exact=True).click()
+        await expect(page.locator('.task-row')).to_contain_text('API 实验提交')
+        assert app.state.store.get(task['id'])['config']['submit_mode']=='api'
+        assert not app.state.engine.busy
+        assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
         await browser.close()

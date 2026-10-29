@@ -231,3 +231,17 @@ def test_open_only_browser_endpoint_does_not_request_login_page(tmp_path):
         response = client.post('/api/account/login?open_only=true')
         assert response.status_code == 200
         app.state.browser.login.assert_awaited_once_with(open_only=True)
+
+
+def test_api_mode_is_optional_and_persisted_without_starting(tmp_path, config):
+    app, client = client_for(tmp_path)
+    with client:
+        assert config.submit_mode == 'dom'
+        payload = config.model_dump(mode='json')
+        payload['submit_mode'] = 'api'
+        created = client.post('/api/tasks',json=payload)
+        assert created.status_code == 201
+        assert created.json()['config']['submit_mode'] == 'api'
+        assert created.json()['status'] == 'draft' and not app.state.engine.busy
+        payload['submit_mode'] = 'retry-until-success'
+        assert client.post('/api/tasks',json=payload).status_code == 422

@@ -163,6 +163,24 @@ class TimerClock:
         self.ticks += seconds
 
 
+async def test_api_last_dispatch_checks_monotonic_deadline_even_after_clock_rollback(store, config):
+    clock = TimerClock()
+    cfg = config.model_copy(update={'scheduled_at':clock.wall,'window_seconds':1,'submit_mode':'api'})
+    class ApiClock(FakeAdapter):
+        on_submit_order = None
+        async def submit(self, cfg):
+            clock.ticks = 2
+            clock.wall = cfg.scheduled_at+timedelta(milliseconds=100)
+            self.before_api_dispatch()
+            self.clicks += 1
+    adapter=ApiClock()
+    adapter.result=OrderResult(outcome='unknown',message='模拟未创建订单')
+    engine=Engine(store,lambda:adapter)
+    engine.now=lambda:clock.wall;engine.monotonic=lambda:clock.ticks
+    task=store.create(cfg);engine.start(task['id']);await engine.job
+    assert adapter.clicks == 0 and store.get(task['id'])['submit_intent']
+
+
 @pytest.mark.parametrize('elapsed,expected', [(-.2,.2),(-.6,.5),(0,.5),(4.9,.5),(5,1),(14.9,1),(15,2),(300,2)])
 def test_opening_retry_is_fast_and_aligned_with_sale(store, config, elapsed, expected):
     engine = Engine(store, FakeAdapter)
