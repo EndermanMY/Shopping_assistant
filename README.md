@@ -69,7 +69,7 @@
 
 ## 数据与开发
 
-所有账号会话、数据库、截图、访问码、运行日志与浏览器均保存在被 Git 忽略的 `data/`。截图尽可能遮罩地址节点；请将整个目录视为私人数据。应用不会通过 API 返回京东 Cookie 或访问码。
+账号会话、任务数据库、截图、访问码和运行日志只保存在本机被 Git 忽略的私人数据目录：API 实验版为 `data-api/`，正式版为 `data/`。`data/browsers/` 只保存公共浏览器运行文件。不要公开上传私人运行目录。
 
 ```powershell
 # 完整测试与前端构建
@@ -98,6 +98,6 @@ npm run dev
 购物车短间隔检查主要读取当前页面，整页刷新按 1 秒逐步退避至 5 秒。已提交但结果不明的记录继续保留，遇到限制停止订单重复查询，不重发订单。上述措施不能保证解除平台限制，也不能承诺免封控。
 
 
-独立浏览器版本由 `browser-runtime.lock.json` 固定，源码安装会运行 `install-browser.ps1` 下载 Google 官方构建到项目内，并检查锁定 SHA-256。不会调用本机 Chrome。仅当本地设置 `data/browser-network.json` 明确选择时，助手使用直连或本机 CDP 接管；默认保持系统网络设置。CDP 方式只监听回环地址，其他本机程序在浏览器运行时可能访问该独立会话，关闭浏览器后接口关闭。当前真实恢复情况和验证边界见 [访问异常处理记录](docs/ACCESS_PROTECTION.md)。
+浏览器运行版本由 `browser-runtime.lock.json` 固定，默认使用助手自带浏览器＋普通启动/本机 CDP 接管，跟随系统代理。不会连接本机 Chrome。需要仅助手直连时，关闭助手浏览器后运行 `powershell -ExecutionPolicy Bypass -File configure-browser.ps1 -Network direct`；恢复系统代理用 `-Network system`。API 分支设置在 `data-api/browser-network.json`，独立会话在 `data-api/browser/`。CDP 仅监听本机回环地址，关闭浏览器后接口关闭。
 
-本机已授权并保存 `direct + native_cdp` 模式，使用固定独立目录 `jd-native-direct`；用户已确认首页、登录后及购物车恢复。迁移这套本地设置时，需一并备份 `data/browser-network.json` 和它指向的 `data/browser/` 会话目录，这些私人数据不随源码或便携包发布。实际开售下单仍需单独验收。
+此前正式版的本地访问恢复曾由用户验证，详见历史验收记录。API 实验版不复制该登录会话：首次需在自己的 `data-api/` 目录重新登录。两个版本都没有预置发布者的账号、Cookie 或访问码。
