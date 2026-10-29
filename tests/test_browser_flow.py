@@ -45,6 +45,7 @@ def mock_shop(config):
                 state[path.path] = state.get(path.path, 0) + 1
                 raw, content = b"ok", "text/plain"
             elif path.path == "/orders":
+                state['orderReads'] = state.get('orderReads', 0) + 1
                 raw, content = json.dumps([] if state.get("hideOrders") else state["orders"]).encode(), "application/json"
             elif path.path == "/checkout-check":
                 state["selection"] = parse_qs(path.query)["selected"][0]
