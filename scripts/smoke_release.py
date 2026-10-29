@@ -59,10 +59,11 @@ def main():
             overview = client.get('/api/overview').json()
             assert overview['tasks'] == [] and overview['busy_task'] is None
             report['checks']['authentication_and_empty_private_data'] = True
-            client.post('/api/account/login').raise_for_status()
+            client.post('/api/account/login?open_only=true').raise_for_status()
             account = client.get('/api/account/status').json()
             assert account['browser_open'] and not account['logged_in']
             report['checks']['bundled_playwright_driver_and_chromium'] = True
+            report['checks']['browser_smoke_no_jd_navigation'] = True
             client.post('/api/account/close').raise_for_status()
             report['checks']['browser_closes'] = True
             client.post('/api/auth/logout').raise_for_status()

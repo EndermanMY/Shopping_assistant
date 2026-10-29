@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import zipfile
+import sys
 from pathlib import Path
 
 
@@ -30,6 +31,12 @@ def main():
     report=json.loads((root/'data/qa/release-smoke.json').read_text(encoding='utf-8'))
     assert report['version']==version
     report.update(archive_sha256=checksum,executable_sha256=exe_hash,files=len(names),manifest_verified=len(manifest),archive_crc_ok=True,private_data_excluded=True,size_bytes=archive.stat().st_size)
+    sys.path.insert(0, str(root))
+    from scripts.audit_publication import audit_bundle, audit_embedded, local_needles
+    needles = local_needles()
+    report['privacy_audit'] = {'archive_files_checked':audit_bundle(archive,needles),
+        'embedded_modules_checked':audit_embedded(bundle/'ShoppingAssistant.exe',needles),
+        'private_values_included':False}
     (archive.parent/f'v{version}-validation.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     print(json.dumps(report,ensure_ascii=False))
 
