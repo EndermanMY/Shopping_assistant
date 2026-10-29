@@ -70,6 +70,7 @@ if(stage==='payment'){
 if (stage === 'orders') {
  fetch('/orders').then(r=>r.json()).then(orders => {
   root.innerHTML=orders.length?orders.map(o=>cfg.modernOrders ? `<article class="orderCard-test"><div class="orderMetas-test">订单号<div>${o.id}</div></div><a href="https://item.jd.com/${sku}.html">${name}</a><span class="countNum-test">1</span><time class="orderTime-test">${o.time}</time><span class="priceRow-test">¥ ${(cfg.total/100).toFixed(2)}</span><p>等待付款</p></article>` : `<article data-order-id="${o.id}"><a href="https://item.jd.com/${sku}.html">${name}</a><span data-testid="quantity">1</span><time data-testid="order-time">${o.time}</time><span data-testid="order-total">¥ ${(cfg.total/100).toFixed(2)}</span><p>等待付款</p></article>`).join(''):'暂无订单';
+  if(cfg.hideOrderTotal)root.querySelectorAll('[data-testid="order-total"],[class^="priceRow-"]').forEach(n=>n.remove());
  });
 }
 </script></body></html>

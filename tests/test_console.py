@@ -73,7 +73,7 @@ async def test_console_create_start_stop_and_responsive_layout(console_server, c
         await expect(page.locator(".task-row")).to_have_count(1)
         await expect(page.locator(".task-row")).to_contain_text("待启用")
         await page.get_by_role("button",name="启用",exact=True).click()
-        await expect(page.locator(".status-badge")).to_contain_text("购物车等待")
+        await expect(page.locator(".status-badge")).to_contain_text("等待开抢")
         await page.get_by_role("button",name="停止",exact=True).click()
         await expect(page.locator(".status-badge")).to_contain_text("已停止")
         assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
@@ -149,7 +149,7 @@ async def test_custom_timing_and_delete_running_task_can_restore(console_server,
         saved=app.state.store.tasks()[0]
         assert saved['config']['advance_ms']==350 and saved['config']['window_seconds']==913
         await page.get_by_role('button',name='启用',exact=True).click()
-        await expect(page.locator('.status-badge')).to_contain_text('购物车等待')
+        await expect(page.locator('.status-badge')).to_contain_text('等待开抢')
         await page.get_by_role('button',name=f'删除任务 {config.product.sku}',exact=True).click()
         await expect(page.locator('.task-row')).to_have_count(0)
         assert not app.state.engine.busy
