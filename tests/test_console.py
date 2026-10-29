@@ -214,3 +214,55 @@ async def test_order_created_without_cashier_does_not_display_success(console_se
         await expect(page.locator('.order-result strong')).to_have_text('订单已创建，流程待确认')
         await expect(page.locator('.order-result')).to_contain_text('尚未确认进入付款界面')
         await browser.close()
+
+
+@pytest.mark.parametrize('entry', ['details', 'list'])
+async def test_unknown_order_can_reset_from_details_without_starting(console_server, config, entry):
+    from assistant.models import Status
+    app, origin = console_server
+    task = app.state.store.create(config)
+    app.state.store.update(task['id'], status=Status.WAITING, submit_intent='unknown-attempt',
+        result={'outcome':'unknown','message':'需要核对订单','payment_entered':False})
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page(viewport={'width':375,'height':900})
+        await page.goto(origin)
+        await page.get_by_label('控制台访问码').fill(app.state.access.code)
+        await page.get_by_role('button',name='连接工作台').click()
+        await expect(page.get_by_role('button',name='核验订单',exact=True)).to_be_visible()
+        if entry == 'list':
+            await page.get_by_role('button',name=f'重置任务 {config.product.sku}',exact=True).click()
+        else:
+            await page.get_by_role('button',name=f'查看任务 {config.product.sku}').click()
+            await page.get_by_role('button',name='重置到抢购前',exact=True).click()
+        confirm = page.get_by_role('button',name='确认未下单并重置',exact=True)
+        await expect(confirm).to_be_disabled()
+        await page.get_by_role('checkbox',name='我已检查京东订单列表，确认本次没有生成订单').check()
+        await confirm.click()
+        await expect(page.get_by_role('dialog',name='任务详情')).to_be_visible()
+        await expect(page.locator('.detail-message')).to_contain_text('已确认未下单并重置')
+        await expect(page.get_by_role('button',name='修改配置',exact=True)).to_be_enabled()
+        assert app.state.store.get(task['id'])['submit_intent'] is None
+        assert not app.state.engine.busy
+        assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        await browser.close()
+
+
+async def test_api_candidate_order_is_shown_without_success_or_reset(console_server, config):
+    app, origin = console_server
+    task = app.state.store.create(config)
+    app.state.store.update(task['id'], status='waiting_human', submit_intent='api-unknown',
+                           submission_order_id='123456789012')
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page(viewport={'width':375,'height':900})
+        await page.goto(origin)
+        await page.get_by_label('控制台访问码').fill(app.state.access.code)
+        await page.get_by_role('button',name='连接工作台').click()
+        await expect(page.get_by_role('button',name=f'重置任务 {config.product.sku}',exact=True)).to_have_count(0)
+        await page.get_by_role('button',name=f'查看任务 {config.product.sku}').click()
+        await expect(page.locator('.detail-grid')).to_contain_text('123456789012（待交叉核验）')
+        await expect(page.get_by_role('button',name='重置到抢购前',exact=True)).to_have_count(0)
+        assert await page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        assert not app.state.engine.busy
+        await browser.close()

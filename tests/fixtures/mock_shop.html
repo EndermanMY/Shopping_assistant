@@ -47,7 +47,11 @@ if (stage === 'checkout') {
   root.querySelectorAll('.modePaymentLi-test input').forEach(box=>box.onchange=()=>{root.querySelectorAll('.modePaymentLi-test input').forEach(other=>{if(other!==box)other.checked=false;});root.querySelector('button').textContent=box.closest('.modePaymentLi-test').textContent.includes('微信')?'立即支付':'打白条';});
  }
  document.querySelector('button').onclick=async () => {
-  await fetch('/submit');
+  if(cfg.submitApi){
+   const response=await fetch('https://api.m.jd.com/api?functionId='+(typeof cfg.submitApi==='string'?cfg.submitApi:'pc_trade_submitOrder'),{method:'POST',body:'fixture-only'});
+   const result=await response.json();
+   if(!response.ok || !(result.success===true || (result.code==='0' && result.body?.resultFlag===true)))return;
+  }else await fetch('/submit');
   if(cfg.modernCheckout){
    if(cfg.paymentDelayMs)await new Promise(r=>setTimeout(r,cfg.paymentDelayMs));
    await fetch('/payment-enter');

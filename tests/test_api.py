@@ -155,3 +155,79 @@ def test_invalid_limits_and_timezone_are_rejected(tmp_path, config):
         for patch in ({"max_total_cents":0}, {"quantity":2}, {"scheduled_at":"2026-10-25T10:00:00"}, {"address_hint":" "}):
             raw = config.model_dump(mode="json") | patch
             assert client.post("/api/tasks", json=raw).status_code == 422
+
+
+def test_reset_unknown_attempt_requires_ack_and_preserves_history(tmp_path, config):
+    app, client = client_for(tmp_path)
+    with client:
+        task = client.post('/api/tasks', json=config.model_dump(mode='json')).json()
+        old_config = config.model_copy(update={'scheduled_at':datetime.now(CHINA)-timedelta(minutes=2)})
+        original = app.state.store.update(task['id'], config=old_config.model_dump(mode='json'),
+            status=Status.WAITING, submit_intent='old-intent', submitted_at=datetime.now(CHINA).isoformat(),
+            baseline=['111111111111'], screenshot='old.png',
+            result={'outcome':'unknown','message':'unknown','payment_entered':False},
+            payment_entered_at=None, payment_order_id=None)
+        url = f"/api/tasks/{task['id']}/reset"
+        assert client.post(url, json={}).status_code == 422
+        assert client.post(url, json={'confirm_no_order':'true'}).status_code == 422
+        result = client.post(url, json={'confirm_no_order':True})
+        assert result.status_code == 200, result.text
+        reset = result.json()
+        assert reset['status'] == Status.STOPPED and reset['config'] == original['config']
+        for key in ('submit_intent','submitted_at','baseline','result','screenshot','payment_entered_at','payment_order_id'):
+            assert reset[key] is None
+        import json
+        snapshot = json.loads(app.state.store.db.execute('SELECT snapshot FROM task_resets').fetchone()[0])
+        assert snapshot['submit_intent'] == 'old-intent' and snapshot['result']['outcome'] == 'unknown'
+        assert not app.state.engine.busy
+        assert client.post(f"/api/tasks/{task['id']}/start").status_code == 409  # old scene not reused
+        assert client.put(f"/api/tasks/{task['id']}",json=config.model_dump(mode='json')).status_code == 200
+
+
+@pytest.mark.parametrize('problem', ['pending', 'network', 'created', 'running'])
+def test_reset_refuses_existing_orders_busy_or_unreadable_list(tmp_path, config, problem):
+    from assistant.models import NeedsHuman
+    app, client = client_for(tmp_path)
+    class Blocked(FakeAdapter):
+        async def baseline(self, config):
+            if problem == 'pending':
+                raise NeedsHuman('订单列表已有该商品的待付款订单')
+            raise RuntimeError('network')
+    with client:
+        task = client.post('/api/tasks',json=config.model_dump(mode='json')).json()
+        app.state.store.update(task['id'],status=Status.WAITING,submit_intent='keep-intent')
+        if problem == 'created':
+            app.state.store.update(task['id'],result={'outcome':'created','order_id':'123456789012'})
+        if problem == 'running':
+            other_config = config.model_copy(update={'product':config.product.model_copy(update={'sku':'100000000002'})})
+            other = client.post('/api/tasks',json=other_config.model_dump(mode='json')).json()
+            assert client.post(f"/api/tasks/{other['id']}/start").status_code == 200
+        else:
+            app.state.engine.adapter_factory = Blocked
+        response = client.post(f"/api/tasks/{task['id']}/reset",json={'confirm_no_order':True})
+        assert response.status_code == (502 if problem == 'network' else 409)
+        assert app.state.store.get(task['id'])['submit_intent'] == 'keep-intent'
+        assert app.state.store.db.execute('SELECT COUNT(*) FROM task_resets').fetchone()[0] == 0
+
+
+def test_cooldown_blocks_repeated_start_and_resume_without_changing_task(tmp_path, config):
+    app, client = client_for(tmp_path)
+    with client:
+        task = client.post('/api/tasks',json=config.model_dump(mode='json')).json()
+        app.state.browser.protection.pause('当前页面异常')
+        for operation in ('start','resume','resume'):
+            response = client.post(f"/api/tasks/{task['id']}/{operation}")
+            assert response.status_code == 409
+        assert not app.state.engine.busy
+        assert app.state.store.get(task['id'])['status'] == Status.DRAFT
+        assert client.get('/api/account/status').json()['access_paused']
+
+
+def test_open_only_browser_endpoint_does_not_request_login_page(tmp_path):
+    from unittest.mock import AsyncMock
+    app, client = client_for(tmp_path)
+    with client:
+        app.state.browser.login = AsyncMock()
+        response = client.post('/api/account/login?open_only=true')
+        assert response.status_code == 200
+        app.state.browser.login.assert_awaited_once_with(open_only=True)
