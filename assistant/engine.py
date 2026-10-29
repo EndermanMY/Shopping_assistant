@@ -137,12 +137,24 @@ class Engine:
             message = "开抢提醒已设置，已在购物车等待；资格在结算时校验" if booking == "reminder_set" else "无需预约，已在购物车等待抢购时间" if booking == "not_required" else "预约已确认，已在购物车等待抢购时间"
             self.state(task_id, Status.SCHEDULED, message)
             self.log(task_id, f"实际抢购区间 {config.purchase_start.isoformat(timespec='milliseconds')} 至 {config.purchase_end.isoformat(timespec='milliseconds')}；提前 {config.advance_ms} 毫秒，持续 {config.window_seconds} 秒")
+            if hasattr(adapter, 'prepare_checkout') and self.now() < config.purchase_start:
+                self.log(task_id, f"结算预检查计划：{config.checkout_prepare_at.isoformat(timespec='milliseconds')} 开始，目标 {config.checkout_ready_by.isoformat(timespec='milliseconds')} 前完成；只准备，不提交")
+                await self.wait_for_start(config.checkout_prepare_at)
+                if self.now() < config.purchase_start:
+                    self.state(task_id, Status.PRECHECKING, "正在提前核对结算商品、数量、地址和金额；尚未提交")
+                    try:
+                        await adapter.prepare_checkout(config)
+                        self.state(task_id, Status.SCHEDULED, "结算页核验已完成，等待实际抢购时间提交")
+                        if self.now() > config.checkout_ready_by:
+                            self.log(task_id, "准备完成晚于提前 10 秒的目标；将在有效抢购窗口内提交，不提前下单", "warning")
+                    except NotReady as exc:
+                        self.state(task_id, Status.SCHEDULED, f"提前准备尚未就绪：{exc}；到点继续检查解锁，不提前提交")
             await self.wait_for_start(config.purchase_start)
             until = config.purchase_end
             if fresh.sale_end:
                 until = min(until, datetime.fromisoformat(fresh.sale_end))
             monotonic_end = self.monotonic() + max(0, (until - self.now()).total_seconds())
-            self.state(task_id, Status.RUNNING, "已到实际抢购开始时间，等待目标商品解锁并核对结算")
+            self.state(task_id, Status.RUNNING, "已到实际抢购开始时间，快速复核已准备结算；未解锁商品继续检查")
             attempt = 0
             while self.now() < until and self.monotonic() < monotonic_end:
                 if not await self.wait_for_start(config.purchase_start, monotonic_end):
@@ -269,7 +281,7 @@ class Engine:
                 await self.job
             except asyncio.CancelledError:
                 pass
-            if self.store.get(task_id)["status"] in {Status.PREPARING, Status.RESERVING, Status.CART, Status.SCHEDULED, Status.RUNNING}:
+            if self.store.get(task_id)["status"] in {Status.PREPARING, Status.RESERVING, Status.CART, Status.PRECHECKING, Status.SCHEDULED, Status.RUNNING}:
                 self.state(task_id, Status.STOPPED, "任务已停止，未提交订单")
         return self.store.get(task_id)
 

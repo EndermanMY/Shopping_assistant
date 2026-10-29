@@ -11,13 +11,14 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from playwright.async_api import expect
+from playwright.async_api import expect, TimeoutError as PlaywrightTimeoutError
 
 from ..models import CHINA, Checkout, NeedsHuman, NotReady, OrderResult, Product, TaskConfig
 from ..protection import AccessLimited, check_access, check_page_access
 from .jd_api import SubmitProbe
 from .jd_api import SubmitSignal
 from .jd_submit_bridge import PageSignedSubmit
+from .checkout_proof import CheckoutProof
 
 
 @dataclass
@@ -244,6 +245,9 @@ class JDAdapter:
         self.before_api_dispatch = None
         self.api_bridge = None
         self.api_signal = SubmitSignal()
+        self.checkout_open = False
+        self.checkout_proof = None
+        self.checked_checkout = None
 
     async def _wait_product_ready(self):
         # Text locators can pick an earlier hidden promotion element. Wait on
@@ -462,7 +466,7 @@ class JDAdapter:
         self.cart_refreshes += 1
         await self._guard()
 
-    async def _cart_settle_button(self, config: TaskConfig):
+    async def _cart_settle_button(self, config: TaskConfig, *, preflight=False):
         # JD can replace “去结算” with “领券结算”. The count also updates
         # asynchronously after selection. Ignore hidden responsive copies.
         pattern = re.compile(r"^(?:去结算|领券结算)\s*[（(]\s*1\s*[)）]$")
@@ -484,22 +488,42 @@ class JDAdapter:
         button = visible[0]
         if not await button.is_enabled() or await button.get_attribute('aria-disabled')=='true':
             raise NotReady("结算入口尚不可用，等待购物车刷新")
-        if datetime.now(CHINA) < config.purchase_start:
+        if datetime.now(CHINA) < (config.checkout_prepare_at if preflight else config.purchase_start):
             raise NotReady("尚未到实际抢购时间，未点击结算")
         if datetime.now(CHINA) >= until:
             raise NotReady("本场次结算窗口已结束，未点击结算")
         return button
 
     async def checkout(self, config: TaskConfig) -> Checkout:
+        return await self._checkout(config)
+
+    async def prepare_checkout(self, config: TaskConfig) -> Checkout:
+        try:
+            return await self._checkout(config, preflight=True)
+        except (NotReady, PlaywrightTimeoutError) as exc:
+            await self._guard()
+            self.checkout_open = False
+            if not self.page.url.startswith(self.urls.cart):
+                await self.page.goto(self.urls.cart, wait_until='domcontentloaded')
+                await self._guard()
+            if isinstance(exc, PlaywrightTimeoutError):
+                raise NotReady('开售前结算页尚未准备好') from None
+            raise
+
+    async def _checkout(self, config: TaskConfig, *, preflight=False) -> Checkout:
         check_access(self.browser)
-        if datetime.now(CHINA) < config.purchase_start:
+        if datetime.now(CHINA) < (config.checkout_prepare_at if preflight else config.purchase_start):
             raise NotReady("尚未到实际抢购开始时间，不进入购物车结算")
+        if self.checkout_open:
+            await self._guard()
+            return await self.recheck_checkout(config, allow_pending_price=preflight)
         if not self.cart_ready:
             await self.prepare_cart(config)
-        self.cart_attempts += 1
+        if not preflight:
+            self.cart_attempts += 1
         if not self.page.url.startswith(self.urls.cart):
             await self.page.goto(self.urls.cart,wait_until="domcontentloaded")
-        elif self.cart_attempts > 1 and self.cart_refresh_due():
+        elif not preflight and self.cart_attempts > 1 and self.cart_refresh_due():
             await self.refresh_cart()
         link, row, checkbox = await self._cart_target(config.product.sku)
         try:
@@ -511,7 +535,7 @@ class JDAdapter:
         if await checkbox.count() != 1:
             raise NeedsHuman("无法唯一定位目标商品勾选框，需要校准购物车")
         if not await checkbox.is_enabled():
-            if self.cart_attempts == 1:
+            if not preflight and self.cart_attempts == 1:
                 await self.refresh_cart()
                 link, row, checkbox = await self._cart_target(config.product.sku)
                 await link.wait_for(state="visible",timeout=10000)
@@ -561,13 +585,14 @@ class JDAdapter:
         await set_item(checkbox, True)
         if not await checkbox.is_checked():
             raise NotReady("购物车勾选未生效")
-        settle = await self._cart_settle_button(config)
+        settle = await self._cart_settle_button(config, preflight=preflight)
         await settle.click()
         goods = self.page.locator(SELECTORS["goods"])
         await goods.first.wait_for(state="visible", timeout=15000)
         await self._guard()
         await self.ensure_manual_payment()
-        return await self.read_checkout(config)
+        self.checkout_open = True
+        return await self.read_checkout(config, allow_pending_price=True) if preflight else await self.read_checkout(config)
 
     async def ensure_manual_payment(self):
         """The new checkout defaults to credit. Select a manual QR cashier."""
@@ -602,7 +627,28 @@ class JDAdapter:
             raise NeedsHuman("付款方式不是唯一的微信扫码手动付款，已暂停提交")
         return True
 
-    async def read_checkout(self, config: TaskConfig) -> Checkout:
+    async def recheck_checkout(self, config: TaskConfig, *, allow_pending_price=False) -> Checkout:
+        await self._guard()
+        if self.checkout_proof is not None and self.checked_checkout is not None and await self.checkout_proof.matches(config):
+            return self.checked_checkout
+        return await self.read_checkout(config, allow_pending_price=True) if allow_pending_price else await self.read_checkout(config)
+
+    async def read_checkout(self, config: TaskConfig, *, allow_pending_price=False) -> Checkout:
+        proof = await CheckoutProof.capture(self.page,
+            [SELECTORS[key] for key in ('goods','total','address')]+['[class*="modePaymentLi-"]'], config)
+        try:
+            checked = await self._read_checkout_fields(config, allow_pending_price=allow_pending_price)
+            if not await proof.matches(config):
+                raise NotReady('结算信息在核对时发生变化，等待页面稳定后重新核对')
+        except BaseException:
+            await proof.close()
+            raise
+        if self.checkout_proof is not None:
+            await self.checkout_proof.close()
+        self.checkout_proof, self.checked_checkout = proof, checked
+        return checked
+
+    async def _read_checkout_fields(self, config: TaskConfig, *, allow_pending_price=False) -> Checkout:
         goods = self.page.locator(SELECTORS["goods"])
         links = await goods.locator('a[href*="item.jd.com/"]').all()
         skus = set()
@@ -664,7 +710,13 @@ class JDAdapter:
         totals = set()
         for item in await self.page.locator(SELECTORS["total"]).all():
             if await item.is_visible():
-                totals.add(money_cents(await item.inner_text()))
+                label = await item.inner_text()
+                try:
+                    totals.add(money_cents(label))
+                except NeedsHuman:
+                    if allow_pending_price and re.search('待发布|待公布|暂无价格|开售后', label):
+                        raise NotReady('开售前应付价格尚未公布') from None
+                    raise
         if len(totals) != 1:
             raise NeedsHuman("应付总额未知或存在歧义，请检查结算页")
         total = totals.pop()
@@ -681,7 +733,7 @@ class JDAdapter:
             raise NeedsHuman("尚未到实际抢购开始时间，未提交订单")
         # Revalidate immediately before the irreversible click.
         await self._guard()
-        checked = await self.read_checkout(config)
+        checked = await self.recheck_checkout(config)
         button = self.page.locator(SELECTORS["submit"])
         visible = [el for el in await button.all() if await el.is_visible()]
         if len(visible) != 1 or not await visible[0].is_enabled():
@@ -704,7 +756,7 @@ class JDAdapter:
                 raise NeedsHuman('API 试验要求已核对的手动扫码付款和持久提交保护；未派发请求')
             self.api_bridge = PageSignedSubmit(self.browser, self.page, self.before_api_dispatch, self._api_order)
             try:
-                self.api_signal = await self.api_bridge.submit(config, checked, visible[0], self.read_checkout)
+                self.api_signal = await self.api_bridge.submit(config, checked, visible[0], self.recheck_checkout)
             except Exception:
                 if self.api_bridge.forwarded == 0:
                     self.api_signal = SubmitSignal('rejected')
@@ -726,6 +778,9 @@ class JDAdapter:
             self.on_submit_order(order_id)
 
     async def aclose(self):
+        if self.checkout_proof is not None:
+            await self.checkout_proof.close()
+            self.checkout_proof = None
         if self.api_bridge is not None:
             await self.api_bridge.close()
         if self.submit_probe is not None:
@@ -761,7 +816,11 @@ class JDAdapter:
                         self.page = page
                         self.payment_entered = True
                         self.payment_flow = 'entered'
-                        match = re.search(r'订单(?:编号|号)\s*[:：]?\s*(\d{8,})',text)
+                        # The cashier can appear between the initial body read
+                        # and the locator checks. Read its current evidence,
+                        # otherwise a newly rendered order ID can be missed.
+                        payment_text = await (dialog if inline else marker if fixture else page.locator('body')).inner_text()
+                        match = re.search(r'订单(?:编号|号)\s*[:：]?\s*(\d{8,})',payment_text)
                         self.payment_order_id = match.group(1) if match else None
                         return self.payment_order_id
                     if not opened and re.search('订单提交成功|下单成功',text):

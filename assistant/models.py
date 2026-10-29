@@ -19,6 +19,7 @@ class Status(StrEnum):
     PREPARING = "preparing"
     RESERVING = "reserving"
     CART = "preparing_cart"
+    PRECHECKING = "preparing_checkout"
     SCHEDULED = "scheduled"
     RUNNING = "running"
     WAITING = "waiting_human"
@@ -32,7 +33,7 @@ class Status(StrEnum):
     INTERRUPTED = "interrupted"
 
 
-ACTIVE = {Status.PREPARING, Status.RESERVING, Status.CART, Status.SCHEDULED, Status.RUNNING,
+ACTIVE = {Status.PREPARING, Status.RESERVING, Status.CART, Status.PRECHECKING, Status.SCHEDULED, Status.RUNNING,
           Status.SUBMITTING, Status.PAYMENT, Status.LOCKING, Status.VERIFYING}
 
 
@@ -68,6 +69,14 @@ class TaskConfig(BaseModel):
     @property
     def purchase_end(self) -> datetime:
         return self.purchase_start + timedelta(seconds=self.window_seconds)
+
+    @property
+    def checkout_prepare_at(self) -> datetime:
+        return self.purchase_start - timedelta(seconds=20)
+
+    @property
+    def checkout_ready_by(self) -> datetime:
+        return self.purchase_start - timedelta(seconds=10)
 
     @field_validator("scheduled_at")
     @classmethod
