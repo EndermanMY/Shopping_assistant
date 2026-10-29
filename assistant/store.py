@@ -26,13 +26,16 @@ class Store:
                 CREATE TABLE IF NOT EXISTS events (
                   id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT,
                   time TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS task_resets (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+                  time TEXT NOT NULL, snapshot TEXT NOT NULL);
             """)
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(tasks)")}
             if "submitted_at" not in columns:
                 self.db.execute("ALTER TABLE tasks ADD COLUMN submitted_at TEXT")
             if "deleted_at" not in columns:
                 self.db.execute("ALTER TABLE tasks ADD COLUMN deleted_at TEXT")
-            for column in ("payment_entered_at", "payment_order_id"):
+            for column in ("payment_entered_at", "payment_order_id", "submission_order_id"):
                 if column not in columns:
                     self.db.execute(f"ALTER TABLE tasks ADD COLUMN {column} TEXT")
             self.db.execute(
@@ -77,7 +80,7 @@ class Store:
         return self.get(task_id)
 
     def update(self, task_id: str, **fields):
-        allowed = {"config", "status", "message", "result", "submit_intent", "baseline", "screenshot", "submitted_at", "payment_entered_at", "payment_order_id"}
+        allowed = {"config", "status", "message", "result", "submit_intent", "baseline", "screenshot", "submitted_at", "payment_entered_at", "payment_order_id", "submission_order_id"}
         if not fields.keys() <= allowed:
             raise ValueError("Invalid task fields")
         values = {}
@@ -92,6 +95,25 @@ class Store:
     def delete(self, task_id: str):
         with self.lock, self.db:
             self.db.execute("UPDATE tasks SET deleted_at=? WHERE id=?", (now_iso(), task_id))
+
+    def reset(self, task_id: str):
+        with self.lock, self.db:
+            task = self.get(task_id)
+            if task is None or task['status'] in ACTIVE:
+                raise ValueError("任务不存在或仍在运行")
+            if task.get('submission_order_id') or task['status'] == Status.SUCCEEDED or (task['result'] and
+                    (task['result'].get('order_id') or task['result']['outcome'] == 'created')):
+                raise ValueError("已有明确订单，不能重置，请先处理京东订单")
+            stamp = now_iso()
+            self.db.execute("INSERT INTO task_resets(task_id,time,snapshot) VALUES(?,?,?)",
+                            (task_id, stamp, json.dumps(task, ensure_ascii=False)))
+            self.db.execute("""UPDATE tasks SET status=?,message=?,updated_at=?,
+                result=NULL,submit_intent=NULL,submitted_at=NULL,baseline=NULL,
+                payment_entered_at=NULL,payment_order_id=NULL,screenshot=NULL WHERE id=?""",
+                (Status.STOPPED, "已确认未下单并重置，请修改场次后重新启用", stamp, task_id))
+            self.db.execute("INSERT INTO events(task_id,time,level,message) VALUES(?,?,?,?)",
+                (task_id, stamp, 'warning', '用户确认本次未生成订单，订单列表检查通过；已重置到抢购前，原提交记录已归档'))
+        return self.get(task_id)
 
     def restore(self, task_id: str):
         with self.lock, self.db:
