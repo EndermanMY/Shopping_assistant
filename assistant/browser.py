@@ -62,7 +62,7 @@ class Browser:
 
     async def task_page(self):
         context = await self.ensure()
-        if self.page is None or self.page.is_closed():
+        if self.page is None or self.page.is_closed() or getattr(self.page, '_api_submit_guarded', False):
             self.page = await context.new_page()
         return self.page
 

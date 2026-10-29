@@ -100,6 +100,18 @@ class Engine:
                     self.log(task_id, f"提交 API 已返回候选订单号 {order_id}，正在核验；尚未报告成功")
                 adapter.on_submit_order = capture_order
                 adapter.on_diagnostic = lambda message: self.log(task_id, message)
+                def before_api_dispatch():
+                    current = self.store.get(task_id)
+                    if not current or not current['submit_intent']:
+                        raise NeedsHuman('提交意图未持久化，未派发 API 请求')
+                    if self.stop_event.is_set():
+                        raise NeedsHuman('任务已停止，未派发 API 请求')
+                    until = min(config.purchase_end, datetime.fromisoformat(config.product.sale_end)) if config.product.sale_end else config.purchase_end
+                    if not config.purchase_start <= self.now() < until:
+                        raise NeedsHuman('场次时间已变化，未派发 API 请求')
+                    if self.monotonic() >= monotonic_end:
+                        raise NeedsHuman('实际执行窗口已结束，未派发 API 请求')
+                adapter.before_api_dispatch = before_api_dispatch
             if stored["submit_intent"]:
                 self.state(task_id, Status.VERIFYING, "检测到历史提交记录，先核对订单，禁止自动重复提交")
                 since = datetime.fromisoformat(stored["submitted_at"]) if stored.get("submitted_at") else config.scheduled_at

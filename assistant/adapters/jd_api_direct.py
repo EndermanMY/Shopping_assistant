@@ -1,10 +1,4 @@
-"""Experimental direct transport, not registered as a live JD task mode.
-
-It needs a fresh, independently calibrated request from the current checkout.
-No JD request builder is guessed here; no saved cookie/signature templates are
-loaded from disk. The production adapter remains response-assisted DOM submit
-until the current JD contract has been calibrated and tested by the user.
-"""
+"""Opt-in experimental native API transport using a current-page SDK request."""
 from __future__ import annotations
 
 import time
@@ -32,6 +26,7 @@ class DirectSubmitTrial:
         self.browser, self.page = browser, page
         self.persist_intent = persist_intent
         self.dispatched = False
+        self.response = None
         self.now = lambda: datetime.now(CHINA)
         self.monotonic = time.monotonic
 
@@ -74,16 +69,19 @@ class DirectSubmitTrial:
                     });
                     const data = response.headers.get('content-type')?.includes('application/json')
                         ? await response.json() : null;
-                    return {status: response.status, data};
+                    return {status: response.status, data, retryAfter: response.headers.get('retry-after') || ''};
                 } finally { clearTimeout(timer); }
             }""", {'url':prepared.url, 'body':prepared.body, 'headers':prepared.headers})
         except Exception:
             # The server may have committed even if fetch timed out/failed CORS.
             return SubmitSignal('unknown')
+        self.response = result
         if result['status'] in (403, 429):
             protection = getattr(self.browser, 'protection', None)
             if protection is not None:
-                protection.pause('京东下单接口限制访问，API 试验已暂停')
+                retry = result.get('retryAfter', '')
+                seconds = max(300, min(3600, int(retry))) if retry.isdigit() and len(retry) <= 6 else 300
+                protection.pause('京东下单接口限制访问，API 试验已暂停', seconds=seconds)
             raise AccessLimited('京东下单接口限制访问；禁止 API 重试或回退点击')
         signal = parse_submit_response(result['data']) if result['status'] == 200 else SubmitSignal()
         if signal.kind == 'restricted':

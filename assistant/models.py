@@ -54,6 +54,7 @@ class TaskConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     product: Product
     quantity: int = Field(default=1, ge=1, le=1)
+    submit_mode: Literal['dom', 'api'] = 'dom'
     scheduled_at: datetime
     advance_ms: int = Field(default=0, ge=0, le=86_400_000, strict=True)
     max_total_cents: int = Field(gt=0, le=100_000_000)
