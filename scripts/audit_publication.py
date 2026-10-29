@@ -40,11 +40,14 @@ def local_needles():
         dbpath = ROOT/folder/'assistant.db'
         if dbpath.exists():
             with sqlite3.connect(dbpath.resolve().as_uri()+'?mode=ro', uri=True) as db:
-                for config, result, payment_id in db.execute('SELECT config,result,payment_order_id FROM tasks'):
+                columns = {row[1] for row in db.execute('PRAGMA table_info(tasks)')}
+                candidate = 'submission_order_id' if 'submission_order_id' in columns else 'NULL'
+                for config, result, payment_id, candidate_id in db.execute(
+                        f'SELECT config,result,payment_order_id,{candidate} FROM tasks'):
                     hint = json.loads(config).get('address_hint', '')
                     if len(hint) >= 4 and '测试' not in hint: values.add(hint)
                     order = json.loads(result).get('order_id') if result else None
-                    for value in (order, payment_id):
+                    for value in (order, payment_id, candidate_id):
                         if value and len(value) >= 8: values.add(value)
     return [value.encode(encoding) for value in values for encoding in ('utf-8', 'utf-16-le')]
 

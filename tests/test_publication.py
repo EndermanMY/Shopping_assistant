@@ -20,3 +20,19 @@ def test_public_source_and_bundle_runtime_are_allowed():
     check_name('ShoppingAssistant/data/browsers/chrome-stable/chrome.exe')
     check_name('ShoppingAssistant/_internal/certifi/cacert.pem')
     check_bytes('example.py', b'print("No login information")', [b'private-test-value'])
+
+
+def test_candidate_order_id_is_scanned_before_final_confirmation(tmp_path, monkeypatch):
+    from scripts import audit_publication
+    from assistant.store import Store
+    monkeypatch.setattr(audit_publication, 'ROOT', tmp_path)
+    store = Store(tmp_path/'data-api'/'assistant.db')
+    # A response-only ID must be protected even with no result/payment ID.
+    with store.db:
+        store.db.execute("INSERT INTO tasks(id,config,status,created_at,updated_at,submission_order_id) VALUES(?,?,?,?,?,?)",
+                         ('fixture', '{}', 'waiting_human', '', '', '98765432101234567890'))
+    needles = audit_publication.local_needles()
+    assert b'98765432101234567890' in needles
+    with pytest.raises(ValueError):
+        check_bytes('example.py', b'98765432101234567890', needles)
+    store.close()
