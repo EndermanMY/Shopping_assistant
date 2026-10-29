@@ -45,7 +45,9 @@
 
 删除是可恢复的列表移除，数据库保留订单核验及防重记录。核验中的提交会等待核验结束，30 秒内未结束则返回 409，请稍后再删除。对已删除、结果不明的同 SKU 提交，新任务仍不能绕过保护直接购买。
 
-状态：`draft` → `preparing` → `reserving`（需要时）→ `preparing_cart` → `scheduled`（停留购物车等待）→ `running` → `submitting` → `entering_payment` → `locking` → `verifying` → `succeeded`。异常进入 `waiting_human`、`failed` 或 `stopped`。服务重启将运行中任务转为 `interrupted`。
+状态：`draft` → `preparing` → `reserving`（需要时）→ `preparing_cart` → `scheduled`（等待实际开始）→ `preparing_checkout`（提前准备）→ `scheduled` → `running` → `submitting` → `entering_payment` → `locking` → `verifying` → `succeeded`。无法提前准备时在购物车等待；任务启动已过实际开始时跳过准备等待。异常进入 `waiting_human`、`failed` 或 `stopped`。服务重启将运行中任务转为 `interrupted`。
+
+v0.2.0-api.2 增加活动状态 `preparing_checkout`：实际开始前 20 秒准备结算，目标提前 10 秒完成，之后回到 `scheduled` 等待提交时刻。结算不可预先完成时保留购物车等待。详情见 [CHECKOUT_PREPARATION.md](CHECKOUT_PREPARATION.md)。
 
 `OrderResult.outcome` 为 `created`、`unknown` 或 `failed`。新流程要求 `created`、`payment_entered=true`，并具备具体新订单号、目标 SKU、数量、金额及待付款证据，才显示“抢购成功”并输出订单号。订单已创建但未确认付款界面时保持 `waiting_human`，保留订单号，不再提交。付款界面出现订单号时，还须与订单列表核验一致。
 
