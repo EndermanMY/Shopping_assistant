@@ -2,6 +2,7 @@ import json
 import asyncio
 import threading
 import time
+import random
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -67,7 +68,14 @@ def mock_shop(config):
             self.send_header("Content-Length",str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
-    server = ThreadingHTTPServer(("127.0.0.1",0),Handler)
+    for _ in range(100):
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1",random.randrange(20000,60000)),Handler)
+            break
+        except OSError:
+            continue
+    else:
+        raise RuntimeError('No safe local mock shop port available')
     thread = threading.Thread(target=server.serve_forever,daemon=True)
     thread.start()
     yield state, f"http://127.0.0.1:{server.server_port}"
@@ -89,6 +97,9 @@ async def browser_harness(request, tmp_path):
         else:
             chromium = await playwright.chromium.launch(headless=True)
             context = await chromium.new_context()
+        await context.route('https://item.jd.com/**', lambda route:route.fulfill(body='<p>Offline SKU detail</p>'))
+        await context.route('https://item.m.jd.com/**', lambda route:route.fulfill(body='<p>Offline SKU detail</p>'))
+        await context.route('https://api.m.jd.com/**', lambda route:route.abort('blockedbyclient'))
         class Harness:
             async def ensure(self):
                 return context

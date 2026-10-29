@@ -7,6 +7,7 @@ import json
 import socket
 import threading
 import time
+import random
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -23,7 +24,14 @@ from tests.test_core import FakeAdapter
 def console_server(tmp_path):
     app = create_app(tmp_path, adapter_factory=FakeAdapter)
     sock = socket.socket()
-    sock.bind(("127.0.0.1",0))
+    for _ in range(100):
+        try:
+            sock.bind(("127.0.0.1",random.randrange(20000,60000)))
+            break
+        except OSError:
+            continue
+    else:
+        raise RuntimeError('No safe local browser test port available')
     port = sock.getsockname()[1]
     sock.close()
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error", access_log=False))
