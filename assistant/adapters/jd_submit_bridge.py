@@ -13,6 +13,7 @@ import time
 from urllib.parse import parse_qs, urlparse
 
 from ..models import NeedsHuman
+from ..protection import AccessLimited, check_access
 from .jd_api import SubmitSignal, submit_endpoint
 from .jd_api_direct import PreparedSubmit, DirectSubmit
 
@@ -35,6 +36,22 @@ class PageSignedSubmit:
         self.signal = SubmitSignal()
         self.status = None
         self.checkout_url = None
+        self.restricted = False
+
+    def _response(self, response):
+        # Network headers remain observable when JS cannot read a CORS reply.
+        request = response.request
+        if (request.method != 'POST' or request.resource_type != 'fetch'
+                or self.prepared is None or request.url != self.prepared.url
+                or self.forwarded != 1 or response.status not in (403, 429)):
+            return
+        self.restricted = True
+        self.status = response.status
+        protection = getattr(self.browser, 'protection', None)
+        if protection is not None:
+            retry = response.headers.get('retry-after', '')
+            seconds = max(300, min(3600, int(retry))) if retry.isdigit() and len(retry) <= 6 else 300
+            protection.pause('京东下单接口限制访问，已停止自动访问', seconds=seconds)
 
     async def _handle(self, route):
         request = route.request
@@ -109,6 +126,7 @@ class PageSignedSubmit:
             self.persist_intent()
             self.armed = True
         client = DirectSubmit(self.browser, self.page, before_send)
+        self.page.on('response', self._response)
         try:
             await button.click(timeout=7000)
             try:
@@ -116,13 +134,17 @@ class PageSignedSubmit:
             except asyncio.TimeoutError:
                 raise NeedsHuman('未取得当前页面生成的已知下单 API 请求，未直调；不会回退点击') from None
             self.signal = await client.submit(config, prepared, recheck)
+            if self.restricted:
+                raise AccessLimited('京东下单接口限制访问，已暂停；不会重试或切换通道')
+            check_access(self.browser)
             if self.signal.order_id and self.on_order is not None:
                 self.on_order(self.signal.order_id)
             return self.signal
         finally:
+            self.page.remove_listener('response', self._response)
             self.armed = False
             response = client.response
-            self.status = response['status'] if response is not None else None
+            self.status = response['status'] if response is not None else self.status
             if self.held is not None:
                 route, self.held = self.held, None
                 try:

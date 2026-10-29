@@ -8,7 +8,7 @@ from assistant.engine import Engine
 from assistant.models import CHINA, Status
 from tests.test_browser_flow import browser_harness, mock_shop, run_shop
 
-async def api_task_backend(context, state, store, *, status=200, drop=False):
+async def api_task_backend(context, state, store, *, status=200, drop=False, cors=True):
     requests = []
     async def handle(route):
         if route.request.method == 'OPTIONS':
@@ -24,8 +24,10 @@ async def api_task_backend(context, state, store, *, status=200, drop=False):
         if drop:
             return await route.abort('connectionreset')
         origin = route.request.headers.get('origin', '')
-        await route.fulfill(status=status, headers={'Content-Type':'application/json',
-            'Access-Control-Allow-Origin':origin, 'Access-Control-Allow-Credentials':'true'},
+        headers = {'Content-Type':'application/json'}
+        if cors:
+            headers.update({'Access-Control-Allow-Origin':origin, 'Access-Control-Allow-Credentials':'true'})
+        await route.fulfill(status=status, headers=headers,
             body=json.dumps({'code':'0','body':{'resultFlag':True,'order':{'orderIdStr':'123456789013'}}}
                             if status == 200 else {'code':'error'}))
     await context.route('https://api.m.jd.com/api?*', handle)
@@ -88,12 +90,13 @@ async def test_opt_in_api_price_change_after_sdk_preparation_sends_no_request(st
     assert store.get(task['id'])['status'] == Status.WAITING
 
 
-async def test_opt_in_api_429_pauses_without_post_submit_order_queries(store, config, mock_shop, browser_harness, tmp_path):
+@pytest.mark.parametrize('status,cors', [(429,True), (429,False), (403,False)])
+async def test_opt_in_api_429_pauses_without_post_submit_order_queries(store, config, mock_shop, browser_harness, tmp_path, status, cors):
     from assistant.protection import AccessProtection
     state, _ = mock_shop
     state.update(modernCheckout=True, submitApi='balance_submitOrder_pc', sdkXHR=True)
     browser_harness.protection = AccessProtection(tmp_path)
-    calls = await api_task_backend(await browser_harness.ensure(), state, store, status=429)
+    calls = await api_task_backend(await browser_harness.ensure(), state, store, status=status, cors=cors)
     config = config.model_copy(update={'use_api':True})
     task, _ = await run_shop(store, config, mock_shop, browser_harness, tmp_path)
     assert len(calls) == 1 and state['submits'] == 0
