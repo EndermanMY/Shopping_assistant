@@ -21,3 +21,5 @@ test-results/
 *.sqlite*
 *.pem
 *.key
+
+data-api/
