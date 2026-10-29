@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 CHINA = ZoneInfo("Asia/Shanghai")
 
@@ -19,6 +19,7 @@ class Status(StrEnum):
     PREPARING = "preparing"
     RESERVING = "reserving"
     CART = "preparing_cart"
+    PRECHECKING = "preparing_checkout"
     SCHEDULED = "scheduled"
     RUNNING = "running"
     WAITING = "waiting_human"
@@ -32,7 +33,7 @@ class Status(StrEnum):
     INTERRUPTED = "interrupted"
 
 
-ACTIVE = {Status.PREPARING, Status.RESERVING, Status.CART, Status.SCHEDULED, Status.RUNNING,
+ACTIVE = {Status.PREPARING, Status.RESERVING, Status.CART, Status.PRECHECKING, Status.SCHEDULED, Status.RUNNING,
           Status.SUBMITTING, Status.PAYMENT, Status.LOCKING, Status.VERIFYING}
 
 
@@ -54,11 +55,32 @@ class TaskConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     product: Product
     quantity: int = Field(default=1, ge=1, le=1)
+    submit_mode: Literal['dom'] = 'dom'
     scheduled_at: datetime
     advance_ms: int = Field(default=0, ge=0, le=86_400_000, strict=True)
-    max_total_cents: int = Field(gt=0, le=100_000_000)
-    address_hint: str = Field(min_length=2, max_length=120)
+    max_total_cents: int | None = Field(default=None, gt=0, le=100_000_000)
+    ignore_price: bool = Field(default=False, strict=True)
+    skip_checks: bool = Field(default=False, strict=True)
+    address_hint: str = Field(default='', max_length=120)
     window_seconds: int = Field(default=60, ge=1, le=86400, strict=True)
+
+    @model_validator(mode='after')
+    def require_budget_unless_ignored(self):
+        if not self.skip_checks and not self.ignore_price and self.max_total_cents is None:
+            raise ValueError('未开启无视价格下单时，必须填写最高应付总额')
+        if not self.skip_checks and len(self.address_hint) < 2:
+            raise ValueError('请填写用于核对的收货地址关键字')
+        return self
+
+    @field_validator('submit_mode', mode='before')
+    @classmethod
+    def migrate_legacy_api_mode(cls, value):
+        # Existing API task records remain readable, but main always clicks.
+        return 'dom' if value == 'api' else value
+
+    def price_allowed(self, total: int | None) -> bool:
+        return self.skip_checks or self.ignore_price or (total is not None and self.max_total_cents is not None
+                                     and 0 < total <= self.max_total_cents)
 
     @property
     def purchase_start(self) -> datetime:
@@ -67,6 +89,14 @@ class TaskConfig(BaseModel):
     @property
     def purchase_end(self) -> datetime:
         return self.purchase_start + timedelta(seconds=self.window_seconds)
+
+    @property
+    def checkout_prepare_at(self) -> datetime:
+        return self.purchase_start - timedelta(seconds=20)
+
+    @property
+    def checkout_ready_by(self) -> datetime:
+        return self.purchase_start - timedelta(seconds=10)
 
     @field_validator("scheduled_at")
     @classmethod
@@ -79,8 +109,6 @@ class TaskConfig(BaseModel):
     @classmethod
     def nonempty_address(cls, value: str) -> str:
         value = value.strip()
-        if len(value) < 2:
-            raise ValueError("请填写用于核对的收货地址关键字")
         return value
 
 
@@ -98,7 +126,7 @@ class OrderResult(BaseModel):
 class Checkout(BaseModel):
     sku: str
     quantity: int
-    total_cents: int
+    total_cents: int | None
     address: str
 
 

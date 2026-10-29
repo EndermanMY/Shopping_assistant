@@ -94,7 +94,7 @@ class Engine:
         try:
             stored = self.store.get(task_id)
             if hasattr(adapter, 'on_submit_order'):
-                adapter.expected_order_id = stored.get('submission_order_id')
+                adapter.expected_order_id = stored.get('submission_order_id') or (stored.get('payment_order_id') if config.skip_checks else None)
                 def capture_order(order_id):
                     self.store.update(task_id, submission_order_id=order_id)
                     self.log(task_id, f"提交 API 已返回候选订单号 {order_id}，正在核验；尚未报告成功")
@@ -106,31 +106,50 @@ class Engine:
                 result = await adapter.verify(config, stored["baseline"] or [], since=since)
                 self.finish(task_id, result)
                 return
+            if config.skip_checks:
+                self.log(task_id, '无需条件核对模式已开启：跳过预约资格、商品、数量、地址和金额核对；仍按设定时间仅提交一次，付款手动完成', 'warning')
+            elif config.ignore_price:
+                self.log(task_id, '此任务已开启无视价格下单：不检查应付金额或预算上限；付款仍由你手动完成', 'warning')
             fresh = await adapter.prepare(config)
-            if fresh.sale_start and abs((datetime.fromisoformat(fresh.sale_start) - config.scheduled_at).total_seconds()) > 2:
+            if not config.skip_checks and fresh.sale_start and abs((datetime.fromisoformat(fresh.sale_start) - config.scheduled_at).total_seconds()) > 2:
                 raise NeedsHuman("商品最新开售时间与任务场次不一致，请更新任务后启动")
             config = config.model_copy(update={"product": fresh})
             self.store.update(task_id, config=config.model_dump(mode="json"))
-            if fresh.reservation_required:
+            if config.skip_checks:
+                booking = 'unchecked'
+            elif fresh.reservation_required:
                 self.state(task_id, Status.RESERVING, "商品需要预约，正在确认并办理预约")
                 booking = await adapter.reserve(config)
             else:
                 booking = "not_required"
                 self.log(task_id, "商品无需预约，继续准备购物车")
             # Capture known order IDs before the time-critical checkout phase.
-            baseline = await adapter.baseline(config)
+            baseline = [] if config.skip_checks else await adapter.baseline(config)
             self.store.update(task_id, baseline=baseline)
-            self.state(task_id, Status.CART, "正在将精确规格加入购物车，并确认数量为 1")
+            self.state(task_id, Status.CART, '正在准备购物车入口；无需条件核对模式不核对商品数量' if config.skip_checks else "正在将精确规格加入购物车，并确认数量为 1")
             await adapter.prepare_cart(config)
-            message = "开抢提醒已设置，已在购物车等待；资格在结算时校验" if booking == "reminder_set" else "无需预约，已在购物车等待抢购时间" if booking == "not_required" else "预约已确认，已在购物车等待抢购时间"
+            message = '无需条件核对模式：等待设定时间，平台预约和库存要求仍由京东决定' if config.skip_checks else "开抢提醒已设置，已在购物车等待；资格在结算时校验" if booking == "reminder_set" else "无需预约，已在购物车等待抢购时间" if booking == "not_required" else "预约已确认，已在购物车等待抢购时间"
             self.state(task_id, Status.SCHEDULED, message)
             self.log(task_id, f"实际抢购区间 {config.purchase_start.isoformat(timespec='milliseconds')} 至 {config.purchase_end.isoformat(timespec='milliseconds')}；提前 {config.advance_ms} 毫秒，持续 {config.window_seconds} 秒")
+            if hasattr(adapter, 'prepare_checkout') and self.now() < config.purchase_start:
+                self.log(task_id, f"结算预检查计划：{config.checkout_prepare_at.isoformat(timespec='milliseconds')} 开始，目标 {config.checkout_ready_by.isoformat(timespec='milliseconds')} 前完成；只准备，不提交")
+                await self.wait_for_start(config.checkout_prepare_at)
+                if self.now() < config.purchase_start:
+                    checks = '商品、数量和地址（已开启无视价格）' if config.ignore_price else '商品、数量、地址和金额'
+                    self.state(task_id, Status.PRECHECKING, '正在提前打开结算页（无需条件核对模式）；尚未提交' if config.skip_checks else f"正在提前核对结算{checks}；尚未提交")
+                    try:
+                        await adapter.prepare_checkout(config)
+                        self.state(task_id, Status.SCHEDULED, '结算页已准备，条件未核对；等待设定时间提交' if config.skip_checks else "结算页核验已完成，等待实际抢购时间提交")
+                        if self.now() > config.checkout_ready_by:
+                            self.log(task_id, "准备完成晚于提前 10 秒的目标；将在有效抢购窗口内提交，不提前下单", "warning")
+                    except NotReady as exc:
+                        self.state(task_id, Status.SCHEDULED, f"提前准备尚未就绪：{exc}；到点继续检查解锁，不提前提交")
             await self.wait_for_start(config.purchase_start)
             until = config.purchase_end
-            if fresh.sale_end:
+            if fresh.sale_end and not config.skip_checks:
                 until = min(until, datetime.fromisoformat(fresh.sale_end))
             monotonic_end = self.monotonic() + max(0, (until - self.now()).total_seconds())
-            self.state(task_id, Status.RUNNING, "已到实际抢购开始时间，等待目标商品解锁并核对结算")
+            self.state(task_id, Status.RUNNING, '已到设定时间，直接执行页面下单；不核对结算条件' if config.skip_checks else "已到实际抢购开始时间，快速复核已准备结算；未解锁商品继续检查")
             attempt = 0
             while self.now() < until and self.monotonic() < monotonic_end:
                 if not await self.wait_for_start(config.purchase_start, monotonic_end):
@@ -142,9 +161,9 @@ class Engine:
                     checkout_started = self.monotonic()
                     checkout = await adapter.checkout(config)
                     checkout_ms = round((self.monotonic() - checkout_started) * 1000)
-                    if checkout.sku != config.product.sku or checkout.quantity != config.quantity:
+                    if not config.skip_checks and (checkout.sku != config.product.sku or checkout.quantity != config.quantity):
                         raise NeedsHuman("结算商品或数量不符")
-                    if checkout.total_cents <= 0 or checkout.total_cents > config.max_total_cents:
+                    if not config.price_allowed(checkout.total_cents):
                         raise NeedsHuman("结算金额超过上限或无法确认")
                     if self.stop_event.is_set():
                         raise asyncio.CancelledError
@@ -155,7 +174,8 @@ class Engine:
                     # Durable intent MUST be written before clicking. Even if
                     # the process dies at the next instruction, recovery only
                     # verifies and never blindly submits again.
-                    self.state(task_id, Status.SUBMITTING, f"商品、数量、地址和金额已核对（本次结算检查 {checkout_ms} 毫秒），正在提交一次订单",
+                    checks = '无需条件核对模式：条件未核对' if config.skip_checks else '商品、数量和地址已核对；无视价格下单已开启' if config.ignore_price else '商品、数量、地址和金额已核对'
+                    self.state(task_id, Status.SUBMITTING, f"{checks}（本次结算检查 {checkout_ms} 毫秒），正在提交一次订单",
                                submit_intent=uuid.uuid4().hex, submitted_at=self.now().isoformat())
                     submit_started = self.monotonic()
                     try:
@@ -163,7 +183,8 @@ class Engine:
                     except Exception:
                         self.log(task_id, "提交响应不明确，先核验订单", "warning")
                     submit_ms = round((self.monotonic() - submit_started) * 1000)
-                    self.state(task_id, Status.PAYMENT, f"提交动作结束（含提交前复核 {submit_ms} 毫秒），正在确认付款界面；未确认前不报告抢购成功")
+                    submit_note = '页面操作耗时' if config.skip_checks else '含提交前复核'
+                    self.state(task_id, Status.PAYMENT, f"提交动作结束（{submit_note} {submit_ms} 毫秒），正在确认付款界面；未确认前不报告抢购成功")
                     try:
                         order_id = await adapter.enter_payment(config)
                         self.store.update(task_id, payment_entered_at=self.now().isoformat(), payment_order_id=order_id)
@@ -174,7 +195,7 @@ class Engine:
                             self.log(task_id, "付款界面已确认，但退出支付状态需人工核对；继续查询订单号", "warning")
                     except Exception:
                         self.log(task_id, "未能确认付款界面，查询是否已创建订单；不会重复提交", "warning")
-                    self.state(task_id, Status.VERIFYING, "正在查看订单号并核对商品、数量、金额和待付款状态")
+                    self.state(task_id, Status.VERIFYING, '正在读取本次页面提交产生的订单号；不进行商品、地址或金额复核' if config.skip_checks else "正在查看订单号并核对商品、数量、金额和待付款状态")
                     result = await adapter.verify(config, baseline, since=datetime.fromisoformat(self.store.get(task_id)["submitted_at"]))
                     self.finish(task_id, result)
                     return
@@ -206,12 +227,15 @@ class Engine:
             result = OrderResult(outcome="unknown", message="付款界面订单号与订单列表不一致，请人工核对")
         if result.outcome == 'created' and stored.get('submission_order_id') and result.order_id != stored['submission_order_id']:
             result = OrderResult(outcome='unknown', order_id=stored['submission_order_id'], message='提交 API 订单号与订单列表不一致，请人工核对；不会重复提交')
-        if result.outcome == "created" and (not result.order_id or result.sku != config.product.sku
-                or result.total_cents is None or not 0 < result.total_cents <= config.max_total_cents):
+        if result.outcome == "created" and (not result.order_id or (not config.skip_checks and result.sku != config.product.sku)
+                or not config.price_allowed(result.total_cents)):
             result = OrderResult(outcome="unknown", message="缺少明确订单号、匹配商品或金额证据，请人工核对")
         if result.outcome == "created" and result.payment_entered:
             suffix = "；支付退出状态需人工核对" if result.payment_flow == "not_confirmed" else ""
-            result = result.model_copy(update={"message": f"抢购成功，锁单成功！订单号：{result.order_id}，待付款 ¥{result.total_cents / 100:.2f}" + suffix})
+            if config.skip_checks:
+                suffix += '；无需条件核对模式，商品、数量、地址及金额未核对'
+            payable = f'待付款 ¥{result.total_cents / 100:.2f}' if result.total_cents is not None else '待付款，金额以京东订单为准'
+            result = result.model_copy(update={"message": f"抢购成功，锁单成功！订单号：{result.order_id}，{payable}" + suffix})
             status = Status.SUCCEEDED
         elif result.outcome == "created":
             result = result.model_copy(update={"message": f"已创建订单 {result.order_id}，但未确认进入付款界面，请人工核对；不会再次提交"})
@@ -257,7 +281,7 @@ class Engine:
                 await self.job
             except asyncio.CancelledError:
                 pass
-            if self.store.get(task_id)["status"] in {Status.PREPARING, Status.RESERVING, Status.CART, Status.SCHEDULED, Status.RUNNING}:
+            if self.store.get(task_id)["status"] in {Status.PREPARING, Status.RESERVING, Status.CART, Status.PRECHECKING, Status.SCHEDULED, Status.RUNNING}:
                 self.state(task_id, Status.STOPPED, "任务已停止，未提交订单")
         return self.store.get(task_id)
 
