@@ -1,8 +1,10 @@
-# API 直调可行性试验（2026-10-29）
+# API 提交实现与历史可行性试验
+
+更新于 2026-10-30：v0.2.0 已将可选 API 提交合入主分支，以每任务 `use_api` 开关控制，默认关闭。独立 `codex/api-trial` 分支在合入、测试与正式发布后退役，历史预发布标签保留。当前使用方法见 [提交方式说明](SUBMISSION_PATHS.md)。以下 2026-10-29 部分为历史试验记录，不代表当前功能开关或下单验收状态。
 
 对应 [Issue #2](https://github.com/EndermanMY/shopping-assistant/issues/2)。[Issue #1](https://github.com/EndermanMY/shopping-assistant/issues/1) 的浏览访问修复沿用现有实现，本轮不重新排查。本记录描述首次可行性试验；提交响应取证与访问修复随 v0.1.2 发布，API 下单在独立分支继续开发。
 
-## 当前结论
+## 2026-10-29 试验结论
 
 **同会话只读 API 直调已在真实京东通过；API 直接创建订单尚未实测，未接入任务启动开关。**
 
