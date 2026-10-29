@@ -96,6 +96,6 @@ npm run dev
 购物车短间隔检查主要读取当前页面，整页刷新按 1 秒逐步退避至 5 秒。已提交但结果不明的记录继续保留，遇到限制停止订单重复查询，不重发订单。上述措施不能保证解除平台限制，也不能承诺免封控。
 
 
-独立浏览器版本由 `browser-runtime.lock.json` 固定，源码安装会运行 `install-browser.ps1` 下载 Google 官方构建到项目内，并检查锁定 SHA-256。不会调用本机 Chrome。仅当本地设置 `data/browser-network.json` 明确选择时，助手使用直连或本机 CDP 接管；默认保持系统网络设置。CDP 方式只监听回环地址，其他本机程序在浏览器运行时可能访问该独立会话，关闭浏览器后接口关闭。当前真实恢复情况和验证边界见 [访问异常处理记录](docs/ACCESS_PROTECTION.md)。
+浏览器运行版本由 `browser-runtime.lock.json` 固定，源码安装通过 `install-browser.ps1` 从官方分发下载并校验 SHA-256，不调用本机 Chrome。默认使用应用专用目录和普通启动＋本机 CDP 接管，并跟随系统代理。需要仅助手直连时，关闭助手浏览器后运行 `powershell -ExecutionPolicy Bypass -File configure-browser.ps1 -Network direct`；恢复跟随系统代理用 `-Network system`。设置保存在 `data/browser-network.json`。CDP 仅监听本机回环地址；运行时其他本机程序可能访问该会话，关闭浏览器后接口关闭。
 
-本机已授权并保存 `direct + native_cdp` 模式，使用固定独立目录 `jd-native-direct`；用户已确认首页、登录后及购物车恢复。迁移这套本地设置时，需一并备份 `data/browser-network.json` 和它指向的 `data/browser/` 会话目录，这些私人数据不随源码或便携包发布。实际开售下单仍需单独验收。
+历史本地恢复验证使用 `direct + native_cdp` 和固定专用目录 `jd-native-direct`，用户确认首页、登录后页面及购物车正常。该会话和网络偏好不随发布包提供；新安装需自行登录。只有在用户自己的电脑迁移时才复制所需会话与设置。浏览恢复不替代真实订单验收。
