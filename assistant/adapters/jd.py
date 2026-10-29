@@ -14,6 +14,8 @@ import httpx
 from playwright.async_api import expect
 
 from ..models import CHINA, Checkout, NeedsHuman, NotReady, OrderResult, Product, TaskConfig
+from ..protection import AccessLimited, check_access, check_page_access
+from .jd_api import SubmitProbe
 
 
 @dataclass
@@ -168,6 +170,8 @@ async def resolve_source(source: str) -> str:
 
 
 async def inspect_product(source: str, browser=None) -> Product:
+    if browser is not None:
+        check_access(browser)
     sku = await resolve_source(source)
     if browser is not None:
         context = await browser.ensure()
@@ -175,6 +179,7 @@ async def inspect_product(source: str, browser=None) -> Product:
         keep_open = False
         try:
             await page.goto(f"https://item.jd.com/{sku}.html", wait_until="domcontentloaded")
+            await check_page_access(browser, page)
             if any(marker in page.url for marker in ("risk_handler", "captcha", "passport", "plogin", "/common/limit.html")):
                 await page.bring_to_front()
                 raise NeedsHuman("京东要求登录或人工验证，请在应用浏览器中处理后重新解析")
@@ -184,6 +189,7 @@ async def inspect_product(source: str, browser=None) -> Product:
         except NeedsHuman:
             keep_open = True
             await page.bring_to_front()
+            await check_page_access(browser, page)
             folder = browser.data / "diagnostics"
             folder.mkdir(parents=True, exist_ok=True)
             html = await page.content()
@@ -193,6 +199,14 @@ async def inspect_product(source: str, browser=None) -> Product:
                           "security_prompt":bool(re.search("安全验证|滑动验证|访问过于频繁", await page.locator("body").inner_text()))}
             (folder / "product.json").write_text(json.dumps(diagnostic,ensure_ascii=False,indent=2),encoding="utf-8")
             await page.screenshot(path=str(folder / "product.png"),mask=[page.locator("#addrArea,[class*='addr']")])
+            raise
+        except Exception:
+            try:
+                await check_page_access(browser, page)
+            except AccessLimited:
+                keep_open = True
+                await page.bring_to_front()
+                raise
             raise
         finally:
             # Leave a verification/login page visible for the user.
@@ -215,18 +229,25 @@ class JDAdapter:
         self.payment_pages_before = set()
         self.cart_ready = False
         self.cart_attempts = 0
+        self.last_cart_refresh = float('-inf')
+        self.cart_refreshes = 0
         self.browser, self.data = browser, data
         self.urls = urls or JDUrls()
         self.page = None
         self.submitted_at: datetime | None = None
+        self.submit_probe = None
+        self.expected_order_id = None
+        self.on_submit_order = None
+        self.on_diagnostic = None
 
     async def _wait_product_ready(self):
         # Text locators can pick an earlier hidden promotion element. Wait on
         # rendered body text instead, including human-intervention messages.
-        await self.page.wait_for_function("""() => /已预约|立即预约|开抢|截止预约|加入购物车|立即购买|到货通知|售完|售罄|安全验证|滑动验证|请登录|访问过于频繁/.test(document.body.innerText)""", timeout=15000)
+        await self.page.wait_for_function("""() => /已预约|立即预约|开抢|截止预约|加入购物车|立即购买|到货通知|售完|售罄|安全验证|滑动验证|请登录|访问过于频繁|操作过于频繁|当前页面异常/.test(document.body.innerText)""", timeout=15000)
 
     async def probe(self, product: Product):
         """Read-only preparation check; no reservation, selection or checkout."""
+        check_access(self.browser)
         self.probe_step = "打开商品页"
         self.page = await self.browser.task_page()
         await self.page.goto(self.urls.product.format(sku=product.sku), wait_until="domcontentloaded")
@@ -265,7 +286,7 @@ class JDAdapter:
                 "message": "只读检查完成；未加购的商品将在启用任务时自动加入购物车。"}
 
     async def _guard(self):
-        text = await self.page.locator("body").inner_text()
+        text = await check_page_access(self.browser, self.page)
         url = self.page.url.lower()
         if any(mark in url for mark in ("captcha", "verify", "pc-frequent", "reason=403")) or re.search("滑动验证|安全验证|请完成验证|访问过于频繁|拖动滑块", text):
             raise NeedsHuman("京东要求人工验证或限制访问，请在电脑浏览器处理后恢复")
@@ -290,6 +311,7 @@ class JDAdapter:
         return reservation_state("\n".join(labels) if labels else text or await self._guard())
 
     async def prepare(self, config: TaskConfig) -> Product:
+        check_access(self.browser)
         self.page = await self.browser.task_page()
         await self.page.goto(self.urls.product.format(sku=config.product.sku), wait_until="domcontentloaded")
         await self._wait_product_ready()
@@ -373,6 +395,7 @@ class JDAdapter:
 
     async def prepare_cart(self, config: TaskConfig):
         """Add only if absent, verify the exact SKU/quantity, then stay in cart."""
+        check_access(self.browser)
         await self.page.goto(self.urls.cart, wait_until="domcontentloaded")
         link, _, _ = await self._cart_target(config.product.sku)
         try:
@@ -420,6 +443,19 @@ class JDAdapter:
         await self.page.locator('#global-loading').wait_for(state="hidden",timeout=15000)
         self.cart_ready = True
         self.cart_attempts = 0
+        self.last_cart_refresh = time.monotonic()
+        self.cart_refreshes = 0
+
+    def cart_refresh_due(self):
+        interval = min(5, 1.5 ** min(max(self.cart_refreshes-1, 0), 4))
+        return time.monotonic() - self.last_cart_refresh >= interval
+
+    async def refresh_cart(self):
+        check_access(self.browser)
+        await self.page.reload(wait_until='domcontentloaded')
+        self.last_cart_refresh = time.monotonic()
+        self.cart_refreshes += 1
+        await self._guard()
 
     async def _cart_settle_button(self, config: TaskConfig):
         # JD can replace “去结算” with “领券结算”. The count also updates
@@ -450,6 +486,7 @@ class JDAdapter:
         return button
 
     async def checkout(self, config: TaskConfig) -> Checkout:
+        check_access(self.browser)
         if datetime.now(CHINA) < config.purchase_start:
             raise NotReady("尚未到实际抢购开始时间，不进入购物车结算")
         if not self.cart_ready:
@@ -457,8 +494,8 @@ class JDAdapter:
         self.cart_attempts += 1
         if not self.page.url.startswith(self.urls.cart):
             await self.page.goto(self.urls.cart,wait_until="domcontentloaded")
-        elif self.cart_attempts > 1:
-            await self.page.reload(wait_until="domcontentloaded")
+        elif self.cart_attempts > 1 and self.cart_refresh_due():
+            await self.refresh_cart()
         link, row, checkbox = await self._cart_target(config.product.sku)
         try:
             await link.wait_for(state="visible", timeout=12000)
@@ -470,7 +507,7 @@ class JDAdapter:
             raise NeedsHuman("无法唯一定位目标商品勾选框，需要校准购物车")
         if not await checkbox.is_enabled():
             if self.cart_attempts == 1:
-                await self.page.reload(wait_until="domcontentloaded")
+                await self.refresh_cart()
                 link, row, checkbox = await self._cart_target(config.product.sku)
                 await link.wait_for(state="visible",timeout=10000)
             if not await checkbox.is_enabled():
@@ -487,12 +524,33 @@ class JDAdapter:
                     await expect(box).not_to_be_checked(timeout=15000)
             await self.page.locator('#global-loading').wait_for(state="hidden", timeout=15000)
 
-        for item_link in await self.page.locator('a[href*="item.jd.com/"]').all():
-            href = await item_link.get_attribute("href") or ""
-            if f"/{config.product.sku}.html" in href:
+        # A product can have image/title links and hidden copies. Read the
+        # selected SKU candidates in one DOM round trip, then revalidate each
+        # actual checkbox before changing it. Unselected rows need no action.
+        selected_skus = await self.page.locator('a[href*="item.jd.com/"]').evaluate_all(r"""links => {
+            const selected = new Set();
+            for (const link of links) {
+                const match = link.href.match(/\/(\d{8,16})\.html/);
+                if (!match) continue;
+                let row = link.closest('[data-rowgid]');
+                if (!row) {
+                    row = link.parentElement;
+                    while (row && !row.querySelector('input[type="checkbox"], [role="checkbox"]')) row = row.parentElement;
+                }
+                if (!row) continue;
+                const boxes = row.querySelectorAll('input[type="checkbox"], [role="checkbox"]');
+                if (boxes.length === 1 && (boxes[0].checked || boxes[0].getAttribute('aria-checked') === 'true')) selected.add(match[1]);
+            }
+            return [...selected];
+        }""")
+        for sku in selected_skus:
+            if sku == config.product.sku:
                 continue
-            item_row = item_link.locator("xpath=ancestor::*[.//*[@role='checkbox' or @type='checkbox']][1]")
-            boxes = item_row.get_by_role("checkbox")
+            other_link = self.page.locator(f'a[href*="/{sku}.html"]').first
+            other_row = other_link.locator('xpath=ancestor::*[@data-rowgid][1]')
+            if not await other_row.count():
+                other_row = other_link.locator("xpath=ancestor::*[.//*[@role='checkbox' or @type='checkbox']][1]")
+            boxes = other_row.get_by_role("checkbox")
             if await boxes.count() == 1 and await boxes.is_visible() and await boxes.is_enabled():
                 await set_item(boxes, False)
         await set_item(checkbox, True)
@@ -559,7 +617,16 @@ class JDAdapter:
                     await title.click()
                 detail = await popup.value
                 try:
-                    await detail.wait_for_load_state("domcontentloaded")
+                    # SKU evidence is the committed destination URL; loading
+                    # the product document/scripts adds no identity evidence.
+                    deadline = time.monotonic() + 10
+                    while detail.url == 'about:blank':
+                        if detail.is_closed() or time.monotonic() >= deadline:
+                            raise NeedsHuman("结算商品详情跳转超时，无法确认精确 SKU")
+                        # Frame URL updates on navigation commit. Avoid a load
+                        # state wait: some drivers never emit 'commit' as a
+                        # load-state event for an already committed popup.
+                        await asyncio.sleep(.01)
                     parsed = urlparse(detail.url)
                     match = re.fullmatch(r"/(\d{8,16})\.html", parsed.path)
                     if parsed.hostname != "item.jd.com" or not match:
@@ -627,7 +694,25 @@ class JDAdapter:
             raise NeedsHuman("本场次提交窗口已结束，未执行提交")
         self.submitted_at = datetime.now(CHINA)
         self.payment_pages_before = set((await self.browser.ensure()).pages)
+        # Observe the request emitted by this exact click. Never send/replay a
+        # second request, even when the browser or server response is unclear.
+        self.submit_probe = SubmitProbe(self.browser, self.page, self._api_order)
+        self.submit_probe.start()
         await visible[0].click(timeout=10000)
+
+    def _api_order(self, order_id):
+        self.expected_order_id = order_id
+        if self.on_submit_order is not None:
+            self.on_submit_order(order_id)
+
+    async def aclose(self):
+        if self.submit_probe is not None:
+            await self.submit_probe.close()
+            if self.on_diagnostic is not None:
+                for sample in self.submit_probe.samples:
+                    self.on_diagnostic(f"提交 API 响应：{sample['endpoint']}，HTTP {sample['http_status']}，"
+                                       f"响应头 {sample['headers_ms']} 毫秒，取证 {sample['body_ms']} 毫秒，状态 {sample['signal']}")
+            self.submit_probe = None
 
     async def enter_payment(self, config: TaskConfig) -> str | None:
         """Observe a real cashier, opening a safe post-order payment entry once."""
@@ -635,12 +720,14 @@ class JDAdapter:
         deadline = time.monotonic()+self.payment_wait_seconds
         opened = False
         while time.monotonic() < deadline:
+            if self.submit_probe is not None:
+                self.submit_probe.check()
             candidates = [self.page]+[p for p in context.pages if p not in self.payment_pages_before and p is not self.page]
             for page in candidates:
                 if page is None or page.is_closed():
                     continue
                 try:
-                    text = await page.locator('body').inner_text()
+                    text = await check_page_access(self.browser, page)
                     dialog = page.locator(SELECTORS['payment_dialog'])
                     marker = page.locator('[data-testid="payment-cashier"]')
                     inline = await dialog.count()==1 and await dialog.is_visible() and "微信APP扫码支付" in await dialog.inner_text()
@@ -658,6 +745,8 @@ class JDAdapter:
                         if len(entries)==1:
                             opened = True
                             await entries[0].click()
+                except AccessLimited:
+                    raise
                 except Exception:
                     continue
             await asyncio.sleep(.15)
@@ -735,22 +824,27 @@ class JDAdapter:
                 await target.close()
 
     async def _orders(self, config: TaskConfig | None = None, since: datetime | None = None, baseline: list[str] | None = None):
+        check_access(self.browser)
         context = await self.browser.ensure()
         page = await context.new_page()
+        restricted = False
         try:
             await page.goto(self.urls.orders, wait_until="domcontentloaded")
+            await check_page_access(self.browser, page)
             cards = page.locator(SELECTORS["order_cards"])
             try:
                 await page.wait_for_function("""selector => document.querySelector(selector) ||
                     /没有相关订单|暂无订单|还没有订单/.test(document.body.innerText)""",
                     arg=SELECTORS["order_cards"], timeout=10000)
+                await check_page_access(self.browser, page)
                 if not await cards.count():
                     return []
             except Exception:
-                text = await page.locator("body").inner_text()
+                text = await check_page_access(self.browser, page)
                 if any(s in text for s in ("没有相关订单", "暂无订单", "还没有订单")):
                     return []
                 raise NeedsHuman("无法读取订单列表，需人工核对后恢复") from None
+            await check_page_access(self.browser, page)
             orders = []
             for card in await cards.all():
                 if await card.locator(SELECTORS["order_cards"]).count():
@@ -805,15 +899,29 @@ class JDAdapter:
                 if navigated:
                     break
             return orders
+        except AccessLimited:
+            restricted = True
+            self.page = page
+            await page.bring_to_front()
+            raise
         finally:
-            await page.close()
+            if not restricted:
+                await page.close()
 
     async def verify(self, config: TaskConfig, baseline: list[str], since: datetime | None = None) -> OrderResult:
         since = since or self.submitted_at or config.scheduled_at
+        probe = self.submit_probe
+        await self.aclose()
+        if probe is not None and probe.signal.kind in {'restricted', 'conflict'}:
+            try:
+                probe.check()
+            except NeedsHuman as exc:
+                return OrderResult(outcome='unknown', order_id=self.expected_order_id, message=str(exc))
         for attempt in range(3):
             try:
                 orders = await self._orders(config, since=since, baseline=baseline)
                 matches = [o for o in orders if o["id"] not in baseline
+                           and (not self.expected_order_id or o['id'] == self.expected_order_id)
                            and o["skus"] == {config.product.sku} and o["pending"]
                            and o["quantity"] == config.quantity
                            and o["stamp"] and since - timedelta(seconds=5) <= o["stamp"] <= datetime.now(CHINA) + timedelta(seconds=5)
@@ -828,11 +936,21 @@ class JDAdapter:
                                        url=self.urls.orders, payment_flow=self.payment_flow, payment_entered=self.payment_entered)
                 if len(matches) > 1:
                     return OrderResult(outcome="unknown", message="发现多个可能匹配的订单，请人工核对")
+            except AccessLimited as exc:
+                return OrderResult(outcome='unknown', order_id=self.expected_order_id, message=str(exc))
+            except NeedsHuman as exc:
+                return OrderResult(outcome='unknown', order_id=self.expected_order_id, message=str(exc)+'；不会自动重复提交')
             except Exception:
                 pass
             if attempt < 2:
                 await asyncio.sleep(2)
-        return OrderResult(outcome="unknown", message="未能确认具体新增订单，请先检查京东订单列表；不会自动重复提交")
+        if self.expected_order_id:
+            return OrderResult(outcome='unknown', order_id=self.expected_order_id,
+                               message=f"提交接口已返回订单号 {self.expected_order_id}，但尚未核实商品、金额和待付款状态；请核对该订单，不会重复提交")
+        message = "未能确认具体新增订单，请先检查京东订单列表；不会自动重复提交"
+        if probe is not None and probe.signal.kind == 'rejected':
+            message = "京东下单接口返回未成功状态，订单列表未找到匹配新订单；请检查结算页，不会重复提交"
+        return OrderResult(outcome="unknown", message=message)
 
     async def screenshot(self, task_id: str) -> str | None:
         if self.page is None or self.page.is_closed():

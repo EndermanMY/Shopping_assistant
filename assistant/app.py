@@ -34,6 +34,10 @@ class Source(BaseModel):
     source: str = Field(min_length=1, max_length=2000)
 
 
+class ResetTask(BaseModel):
+    confirm_no_order: bool = Field(default=False, strict=True)
+
+
 def lan_ips():
     ips = set()
     try:
@@ -60,7 +64,7 @@ def create_app(data: Path | None = None, adapter_factory=None):
         await browser.close()
         store.close()
 
-    app = FastAPI(title="购物小助手", version="0.1.1", lifespan=lifespan,
+    app = FastAPI(title="购物小助手", version="0.1.2", lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store, app.state.access = store, access
     app.state.browser, app.state.engine = browser, engine
@@ -88,7 +92,7 @@ def create_app(data: Path | None = None, adapter_factory=None):
 
     @app.get("/api/health")
     async def health():
-        return {"ok": True, "version": "0.1.1"}
+        return {"ok": True, "version": "0.1.2"}
 
     @app.post("/api/auth/login")
     async def login(body: Login, request: Request, response: Response):
@@ -117,14 +121,15 @@ def create_app(data: Path | None = None, adapter_factory=None):
         return await browser.status()
 
     @app.post("/api/account/login")
-    async def account_login():
+    async def account_login(open_only: bool = False):
         if engine.busy:
             raise HTTPException(409, "请先停止运行任务，再打开登录浏览器")
         try:
-            await browser.login()
+            await browser.login(open_only=open_only)
         except Exception:
             raise HTTPException(503, "登录浏览器启动失败，请检查 Chromium 安装和应用日志") from None
-        return {"ok": True, "message": "已在电脑打开京东登录浏览器"}
+        paused = browser.protection.state()['paused']
+        return {"ok": True, "message": "已显示应用独立浏览器窗口，未请求京东页面" if open_only else "已显示应用浏览器；访问暂停期间不再请求登录，请人工处理异常" if paused else "已在电脑打开京东登录浏览器"}
 
     @app.post("/api/products/resolve")
     async def resolve(body: Source):
@@ -232,8 +237,9 @@ def create_app(data: Path | None = None, adapter_factory=None):
     async def start(task_id: str):
         get_task(task_id)
         try:
+            browser.protection.check()
             engine.start(task_id)
-        except ValueError as exc:
+        except (ValueError, NeedsHuman) as exc:
             raise HTTPException(409, str(exc)) from None
         return store.get(task_id)
 
@@ -241,10 +247,23 @@ def create_app(data: Path | None = None, adapter_factory=None):
     async def resume(task_id: str):
         get_task(task_id)
         try:
+            browser.protection.check()
             engine.start(task_id, resume=True)
-        except ValueError as exc:
+        except (ValueError, NeedsHuman) as exc:
             raise HTTPException(409, str(exc)) from None
         return store.get(task_id)
+
+    @app.post("/api/tasks/{task_id}/reset")
+    async def reset_task(task_id: str, body: ResetTask):
+        get_task(task_id)
+        if not body.confirm_no_order:
+            raise HTTPException(422, "请先检查京东订单列表，确认本次没有生成订单")
+        try:
+            return await engine.reset(task_id)
+        except (ValueError, NeedsHuman) as exc:
+            raise HTTPException(409, str(exc)) from None
+        except Exception:
+            raise HTTPException(502, "订单列表检查未完成，未重置；请检查京东登录和网络后重试") from None
 
     @app.post("/api/tasks/{task_id}/stop")
     async def stop(task_id: str):

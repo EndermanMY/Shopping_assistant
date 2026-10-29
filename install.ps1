@@ -39,6 +39,7 @@ Check-Exit 'Python dependency installation'
 Check-Exit 'Application installation'
 & $venvPython -m playwright install chromium
 Check-Exit 'Chromium installation'
+& (Join-Path $PSScriptRoot 'install-browser.ps1')
 Push-Location -LiteralPath (Join-Path $PSScriptRoot 'frontend')
 try {
     & npm.cmd ci --registry=https://registry.npmjs.org --no-audit --no-fund

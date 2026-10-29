@@ -1,0 +1,6 @@
+{
+  "version": "156.0.8078.47",
+  "source": "https://storage.googleapis.com/chrome-for-testing-public/156.0.8078.47/win64/chrome-win64.zip",
+  "archive_sha256": "a4e0d57245e167e98a9d465af1e3774d2b4ec9f04e483d19bcd97a6f63cf46dd",
+  "relative_path": "chrome-stable-156.0.8078.47/chrome-win64/chrome.exe"
+}

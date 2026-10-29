@@ -163,6 +163,15 @@ class TimerClock:
         self.ticks += seconds
 
 
+@pytest.mark.parametrize('elapsed,expected', [(-.2,.2),(-.6,.5),(0,.5),(4.9,.5),(5,1),(14.9,1),(15,2),(300,2)])
+def test_opening_retry_is_fast_and_aligned_with_sale(store, config, elapsed, expected):
+    engine = Engine(store, FakeAdapter)
+    sale = datetime.now(CHINA)
+    config = config.model_copy(update={'scheduled_at':sale})
+    engine.now = lambda: sale+timedelta(seconds=elapsed)
+    assert engine.retry_interval(config) == pytest.approx(expected)
+
+
 @pytest.mark.parametrize('advance_ms', [0, 250, 1750])
 async def test_purchase_start_and_custom_duration_are_enforced(store, config, advance_ms):
     clock=TimerClock()
@@ -273,3 +282,29 @@ async def test_source_supports_sku_and_direct_link_without_network():
 @pytest.mark.parametrize("url", ["http://127.0.0.1/", "https://jd.com.evil.test/", "file:///data/access.json", "https://user:password@item.jd.com/100327520619.html", "https://item.jd.com:8443/"])
 def test_source_disallows_non_jd_or_private_urls(url):
     assert not allowed_url(url)
+
+
+async def test_reset_reserves_worker_until_order_check_finishes(store, config):
+    import asyncio
+    entered, release = asyncio.Event(), asyncio.Event()
+    class Checking(FakeAdapter):
+        async def baseline(self, config):
+            entered.set()
+            await release.wait()
+            return []
+    adapter = Checking()
+    engine = Engine(store,lambda:adapter)
+    task = store.create(config)
+    store.update(task['id'],status=Status.WAITING,submit_intent='unknown-intent')
+    reset = asyncio.create_task(engine.reset(task['id']))
+    await entered.wait()
+    try:
+        assert engine.busy
+        with pytest.raises(ValueError): engine.start(task['id'],resume=True)
+        with pytest.raises(ValueError): await engine.reset(task['id'])
+        assert store.get(task['id'])['submit_intent'] == 'unknown-intent'
+    finally:
+        release.set()
+    result = await reset
+    assert result['status'] == Status.STOPPED
+    assert adapter.clicks == 0 and not engine.busy

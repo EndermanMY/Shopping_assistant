@@ -5,7 +5,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 
-from .models import CHINA, NeedsHuman, NotReady, OrderResult, Status, TaskConfig
+from .models import ACTIVE, CHINA, NeedsHuman, NotReady, OrderResult, Status, TaskConfig
 
 
 class Engine:
@@ -80,10 +80,26 @@ class Engine:
             await self.delay(min(1, remaining))
         return True
 
+    def retry_interval(self, config):
+        now = self.now()
+        elapsed = (now - config.scheduled_at).total_seconds()
+        interval = .5 if elapsed < 5 else 1 if elapsed < 15 else 2
+        # An early probe must not push the next check past the actual sale.
+        if now < config.scheduled_at:
+            interval = min(interval, (config.scheduled_at - now).total_seconds())
+        return interval
+
     async def run(self, task_id, config):
         adapter = self.adapter_factory()
         try:
             stored = self.store.get(task_id)
+            if hasattr(adapter, 'on_submit_order'):
+                adapter.expected_order_id = stored.get('submission_order_id')
+                def capture_order(order_id):
+                    self.store.update(task_id, submission_order_id=order_id)
+                    self.log(task_id, f"提交 API 已返回候选订单号 {order_id}，正在核验；尚未报告成功")
+                adapter.on_submit_order = capture_order
+                adapter.on_diagnostic = lambda message: self.log(task_id, message)
             if stored["submit_intent"]:
                 self.state(task_id, Status.VERIFYING, "检测到历史提交记录，先核对订单，禁止自动重复提交")
                 since = datetime.fromisoformat(stored["submitted_at"]) if stored.get("submitted_at") else config.scheduled_at
@@ -123,7 +139,9 @@ class Engine:
                     raise asyncio.CancelledError
                 attempt += 1
                 try:
+                    checkout_started = self.monotonic()
                     checkout = await adapter.checkout(config)
+                    checkout_ms = round((self.monotonic() - checkout_started) * 1000)
                     if checkout.sku != config.product.sku or checkout.quantity != config.quantity:
                         raise NeedsHuman("结算商品或数量不符")
                     if checkout.total_cents <= 0 or checkout.total_cents > config.max_total_cents:
@@ -137,13 +155,15 @@ class Engine:
                     # Durable intent MUST be written before clicking. Even if
                     # the process dies at the next instruction, recovery only
                     # verifies and never blindly submits again.
-                    self.state(task_id, Status.SUBMITTING, "商品、数量、地址和金额已核对，正在提交一次订单",
+                    self.state(task_id, Status.SUBMITTING, f"商品、数量、地址和金额已核对（本次结算检查 {checkout_ms} 毫秒），正在提交一次订单",
                                submit_intent=uuid.uuid4().hex, submitted_at=self.now().isoformat())
+                    submit_started = self.monotonic()
                     try:
                         await adapter.submit(config)
                     except Exception:
                         self.log(task_id, "提交响应不明确，先核验订单", "warning")
-                    self.state(task_id, Status.PAYMENT, "正在确认已进入付款界面；未确认前不报告抢购成功")
+                    submit_ms = round((self.monotonic() - submit_started) * 1000)
+                    self.state(task_id, Status.PAYMENT, f"提交动作结束（含提交前复核 {submit_ms} 毫秒），正在确认付款界面；未确认前不报告抢购成功")
                     try:
                         order_id = await adapter.enter_payment(config)
                         self.store.update(task_id, payment_entered_at=self.now().isoformat(), payment_order_id=order_id)
@@ -160,7 +180,7 @@ class Engine:
                     return
                 except NotReady as exc:
                     self.log(task_id, f"第 {attempt} 次检查：{exc}")
-                    await self.delay(min(5, 1.45 ** min(attempt - 1, 5), max(0.001, (until - self.now()).total_seconds()), max(0.001, monotonic_end - self.monotonic())))
+                    await self.delay(min(self.retry_interval(config), max(0.001, (until - self.now()).total_seconds()), max(0.001, monotonic_end - self.monotonic())))
             self.state(task_id, Status.FAILED, "本场次尝试窗口结束，未提交订单")
         except asyncio.CancelledError:
             status = Status.WAITING if self.store.get(task_id)["submit_intent"] else Status.STOPPED
@@ -173,6 +193,9 @@ class Engine:
             # strings into the event stream.
             shot = await adapter.screenshot(task_id)
             self.state(task_id, Status.WAITING, "页面操作或网络请求失败，请检查应用浏览器并恢复", screenshot=shot)
+        finally:
+            if hasattr(adapter, 'aclose'):
+                await adapter.aclose()
 
     def finish(self, task_id, result: OrderResult):
         stored = self.store.get(task_id)
@@ -181,6 +204,8 @@ class Engine:
             result = result.model_copy(update={"payment_entered": True})
         if result.outcome == "created" and stored.get("payment_order_id") and result.order_id != stored["payment_order_id"]:
             result = OrderResult(outcome="unknown", message="付款界面订单号与订单列表不一致，请人工核对")
+        if result.outcome == 'created' and stored.get('submission_order_id') and result.order_id != stored['submission_order_id']:
+            result = OrderResult(outcome='unknown', order_id=stored['submission_order_id'], message='提交 API 订单号与订单列表不一致，请人工核对；不会重复提交')
         if result.outcome == "created" and (not result.order_id or result.sku != config.product.sku
                 or result.total_cents is None or not 0 < result.total_cents <= config.max_total_cents):
             result = OrderResult(outcome="unknown", message="缺少明确订单号、匹配商品或金额证据，请人工核对")
@@ -194,6 +219,30 @@ class Engine:
         else:
             status = Status.WAITING if result.outcome == "unknown" else Status.FAILED
         self.state(task_id, status, result.message, result=result.model_dump())
+
+    async def reset(self, task_id):
+        if self.busy:
+            raise ValueError("请先停止任务或等待订单核验完成")
+        task = self.store.get(task_id)
+        if task is None:
+            raise ValueError("任务不存在")
+        if task.get('submission_order_id') or task['status'] in ACTIVE or task['status'] == Status.SUCCEEDED or (
+                task['result'] and (task['result'].get('order_id') or task['result']['outcome'] == 'created')):
+            raise ValueError("运行中或已有明确订单的任务不能重置")
+
+        async def check_and_reset():
+            # Reserve the same serial worker as purchases, so start/resume,
+            # delete and concurrent reset cannot race the read-only check.
+            adapter = self.adapter_factory()
+            await adapter.baseline(TaskConfig.model_validate(task['config']))
+            updated = self.store.reset(task_id)
+            self.emit({'type': 'task', 'task': updated})
+            self.emit({'type': 'log', 'event': self.store.events(task_id)[-1]})
+            return updated
+
+        self.task_id = task_id
+        self.job = asyncio.create_task(check_and_reset())
+        return await self.job
 
     async def stop(self, task_id):
         if not self.busy or self.task_id != task_id:

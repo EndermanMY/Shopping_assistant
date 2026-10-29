@@ -10,6 +10,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+from assistant.browser_runtime import bundled_executable
 
 
 def main():
@@ -25,16 +26,23 @@ def main():
     else:
         assert (target / 'ShoppingAssistant.exe').is_file()
     (target / 'start.bat').write_text('@echo off\ncd /d "%~dp0"\nShoppingAssistant.exe\npause\n', encoding='ascii')
-    for filename in ('README.md', 'THIRD_PARTY.md', 'requirements.lock.txt', 'requirements-build.lock.txt', 'enable-lan.ps1'):
+    for filename in ('README.md', 'THIRD_PARTY.md', 'requirements.lock.txt', 'requirements-build.lock.txt', 'enable-lan.ps1', 'configure-browser.ps1', 'browser-runtime.lock.json'):
         shutil.copy2(ROOT / filename, target / filename)
     shutil.copytree(ROOT / 'docs', target / 'docs', dirs_exist_ok=args.finalize)
     shutil.copy2(ROOT / 'docs' / f'RELEASE-v{args.version}.md', target / 'READ-ME-FIRST.md')
     browser_dest = target / 'data' / 'browsers'
-    for folder in (ROOT / 'data' / 'browsers').iterdir():
-        if folder.is_dir() and folder.name.startswith(('chromium-', 'ffmpeg-', 'winldd-')):
+    browser_source = ROOT / 'data' / 'browsers'
+    selected_browser = bundled_executable(browser_source)
+    selected_folder = selected_browser.relative_to(browser_source.resolve()).parts[0] if selected_browser else None
+    for folder in browser_source.iterdir():
+        if folder.is_dir() and (folder.name.startswith(('ffmpeg-', 'winldd-')) or
+                (folder.name == selected_folder if selected_folder else folder.name.startswith('chromium-'))):
             if not (args.finalize and (browser_dest / folder.name).is_dir()):
                 shutil.copytree(folder, browser_dest / folder.name)
-    chromium = list(browser_dest.glob('chromium-*/chrome-win*/chrome.exe'))
+    if selected_browser:
+        shutil.copy2(browser_source/'runtime.json', browser_dest/'runtime.json')
+    pinned = bundled_executable(browser_dest)
+    chromium = [pinned] if pinned else list(browser_dest.glob('chromium-*/chrome-win*/chrome.exe'))
     assert len(chromium) == 1, 'One bundled Chromium is required'
 
     licenses = target / 'licenses'

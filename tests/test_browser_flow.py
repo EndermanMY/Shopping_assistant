@@ -12,7 +12,7 @@ from playwright.async_api import async_playwright
 
 from assistant.adapters.jd import JDAdapter, JDUrls, parse_product
 from assistant.engine import Engine
-from assistant.models import CHINA, Status, NeedsHuman
+from assistant.models import CHINA, Status, NeedsHuman, NotReady
 
 
 @pytest.fixture
@@ -77,10 +77,18 @@ def mock_shop(config):
 
 
 @pytest.fixture
-async def browser_harness():
+async def browser_harness(request, tmp_path):
     async with async_playwright() as playwright:
-        chromium = await playwright.chromium.launch(headless=True)
-        context = await chromium.new_context()
+        native = None
+        chromium = None
+        if getattr(request, 'param', 'persistent') == 'native_cdp':
+            from assistant.native_browser import NativeBrowser
+            from assistant.browser_runtime import bundled_executable
+            native = NativeBrowser()
+            context = await native.start(playwright.chromium, bundled_executable(Path(__file__).resolve().parent.parent/'data'/'browsers'), tmp_path/'native-profile', direct=True)
+        else:
+            chromium = await playwright.chromium.launch(headless=True)
+            context = await chromium.new_context()
         class Harness:
             async def ensure(self):
                 return context
@@ -89,8 +97,11 @@ async def browser_harness():
             async def status(self):
                 return {"logged_in":True}
         yield Harness()
-        await context.close()
-        await chromium.close()
+        if native is not None:
+            await native.close()
+        else:
+            await context.close()
+            await chromium.close()
 
 
 async def run_shop(store, config, mock_shop, browser_harness, tmp_path):
@@ -157,6 +168,7 @@ async def test_readonly_probe_reports_absent_cart_item_without_adding(config, mo
     assert state.get('addCalls',0)==0 and state['submits']==0
 
 
+@pytest.mark.parametrize('browser_harness', ['persistent','native_cdp'], indirect=True)
 async def test_full_chain_adds_exact_product_and_reports_order_after_payment(store, config, mock_shop, browser_harness, tmp_path):
     state,_=mock_shop;state.update(needReservation=True,inCart=False,modernCheckout=True,paymentDelayMs=250)
     context=await browser_harness.ensure()
@@ -237,6 +249,7 @@ async def test_async_cart_selection_ignores_store_checkbox(store, config, mock_s
 
 
 @pytest.mark.parametrize('problem', [None, 'wrongSku', 'quantity', 'wrongAddress', 'unknownPrice'])
+@pytest.mark.parametrize('browser_harness', ['persistent','native_cdp'], indirect=True)
 async def test_modern_checkout_follows_exact_product_and_manual_payment(store, config, mock_shop, browser_harness, tmp_path, problem):
     state, _ = mock_shop
     state['modernCheckout'] = True
@@ -338,6 +351,7 @@ async def test_delayed_cart_unlock_retries(store, config, mock_shop, browser_har
     assert state["cartVisits"] >= 2
 
 
+@pytest.mark.parametrize('browser_harness', ['persistent','native_cdp'], indirect=True)
 async def test_uncertain_result_does_not_submit_again_on_resume(store, config, mock_shop, browser_harness, tmp_path):
     state, _ = mock_shop
     state["hideOrders"] = True
@@ -371,6 +385,40 @@ async def test_visible_single_item_settle_entry(config, browser_harness, tmp_pat
     assert await entry.inner_text() == label
 
 
+async def test_checkout_sku_check_does_not_wait_for_detail_scripts(config, mock_shop, browser_harness, tmp_path):
+    state, origin = mock_shop
+    state['modernCheckout'] = True
+    context = await browser_harness.ensure()
+    release_script = asyncio.Event()
+    release_timer = asyncio.get_running_loop().call_later(5, release_script.set)
+
+    async def serve_detail(route):
+        if route.request.url.endswith('/slow.js'):
+            await release_script.wait()
+            try:
+                await route.fulfill(body='/* released after identity check */', content_type='text/javascript')
+            except Exception:
+                pass  # The verified detail tab may already be closed.
+        else:
+            await route.fulfill(body='<script src="https://item.jd.com/slow.js"></script><p>Detail</p>', content_type='text/html')
+
+    await context.route('https://item.jd.com/**', serve_detail)
+    adapter = JDAdapter(browser_harness, tmp_path)
+    adapter.page = await browser_harness.task_page()
+    await adapter.page.goto(origin+'/?stage=checkout')
+    await adapter.ensure_manual_payment()
+    try:
+        # DOMContentLoaded cannot fire until release_script is set. Both the
+        # initial check and the immediate recheck must finish without it.
+        first = await asyncio.wait_for(adapter.read_checkout(config), timeout=3)
+        second = await asyncio.wait_for(adapter.read_checkout(config), timeout=3)
+        assert first.sku == second.sku == config.product.sku
+        assert state['submits'] == 0
+    finally:
+        release_script.set()
+        release_timer.cancel()
+
+
 async def test_settle_waits_for_coupon_count_update(config, browser_harness, tmp_path):
     adapter = JDAdapter(browser_harness, tmp_path)
     adapter.page = await browser_harness.task_page()
@@ -387,3 +435,171 @@ async def test_ambiguous_visible_settle_entries_pause(config, browser_harness, t
     config = config.model_copy(update={"scheduled_at": datetime.now(CHINA)-timedelta(seconds=1)})
     with pytest.raises(NeedsHuman, match="多个可见"):
         await adapter._cart_settle_button(config)
+
+
+async def test_current_page_anomaly_pauses_and_keeps_independent_session(browser_harness, tmp_path):
+    from assistant.browser import Browser
+    from assistant.protection import AccessLimited
+    browser = Browser(tmp_path)
+    adapter = JDAdapter(browser,tmp_path)
+    adapter.page = await browser_harness.task_page()
+    await adapter.page.set_content('<h1>当前页面异常</h1><p>请刷新或切换账号试试</p>')
+    with pytest.raises(AccessLimited): await adapter._guard()
+    assert browser.protection.state()['paused']
+    assert not adapter.page.is_closed()
+
+
+async def test_locked_cart_poll_does_not_reload_every_poll(config, mock_shop, browser_harness, tmp_path):
+    state, origin = mock_shop
+    state['unlockAt'] = int(time.time()*1000)+60000
+    adapter = JDAdapter(browser_harness,tmp_path,JDUrls(cart=origin+'/?stage=cart'))
+    adapter.page = await browser_harness.task_page()
+    await adapter.prepare_cart(config)
+    with pytest.raises(NotReady): await adapter.checkout(config)
+    visits = state['cartVisits']
+    with pytest.raises(NotReady): await adapter.checkout(config)
+    assert state['cartVisits'] == visits
+    adapter.last_cart_refresh -= 6
+    with pytest.raises(NotReady): await adapter.checkout(config)
+    assert state['cartVisits'] == visits+1
+
+
+async def test_order_verification_stops_after_access_restriction(config, browser_harness, tmp_path):
+    from assistant.protection import AccessLimited
+    adapter = JDAdapter(browser_harness,tmp_path)
+    calls = []
+    async def denied(*args, **kwargs):
+        calls.append(1)
+        raise AccessLimited('自动访问已暂停')
+    adapter._orders = denied
+    result = await adapter.verify(config,[])
+    assert result.outcome == 'unknown' and '暂停' in result.message
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('browser_harness', ['persistent', 'native_cdp'], indirect=True)
+@pytest.mark.parametrize('api_function', ['pc_trade_submitOrder', 'balance_submitOrder_pc'])
+async def test_submit_api_candidate_is_durable_and_matches_order_without_extra_submit(store, config, mock_shop, browser_harness, tmp_path, api_function):
+    state, _ = mock_shop
+    state.update(submitApi=api_function, modernCheckout=True, paymentDelayMs=250)
+    context = await browser_harness.ensure()
+    calls = []
+    async def submit(route):
+        task = store.tasks()[0]
+        assert task['submit_intent'] and task['submitted_at']
+        calls.append(1)
+        state['submits'] += 1
+        state['orders'].append({'id':'123456789013','time':datetime.now(CHINA).strftime('%Y-%m-%d %H:%M:%S')})
+        payload = {'success':True,'orderId':'123456789013'} if api_function == 'pc_trade_submitOrder' else {
+            'code':'0', 'body':{'resultFlag':True,'order':{'orderIdStr':'123456789013'}}}
+        await route.fulfill(status=200, headers={'Content-Type':'application/json','Access-Control-Allow-Origin':'*'},
+                            body=json.dumps(payload))
+    await context.route('https://api.m.jd.com/api?*', submit)
+    task, engine = await run_shop(store, config, mock_shop, browser_harness, tmp_path)
+    assert task['status'] == Status.SUCCEEDED, task['message']
+    assert task['submission_order_id'] == task['result']['order_id'] == '123456789013'
+    assert len(calls) == state['submits'] == 1
+    assert any('提交 API 响应' in e['message'] for e in store.events(task['id']))
+    assert not any('h5st' in e['message'] for e in store.events(task['id']))
+
+
+async def test_submit_api_known_order_survives_missing_cashier_and_order_list(store, config, mock_shop, browser_harness, tmp_path):
+    state, _ = mock_shop
+    state.update(submitApi=True, lostResponse=True, hideOrders=True, paymentWaitSeconds=.2)
+    context = await browser_harness.ensure()
+    async def submit(route):
+        state['submits'] += 1
+        await route.fulfill(status=200, headers={'Content-Type':'application/json','Access-Control-Allow-Origin':'*'},
+                            body=json.dumps({'success':True,'orderId':'123456789013'}))
+    await context.route('https://api.m.jd.com/api?*', submit)
+    task, engine = await run_shop(store, config, mock_shop, browser_harness, tmp_path)
+    assert task['status'] == Status.WAITING
+    assert task['submission_order_id'] == task['result']['order_id'] == '123456789013'
+    assert task['result']['outcome'] == 'unknown'
+    assert not task['payment_entered_at'] and '尚未核实' in task['message']
+    with pytest.raises(ValueError, match='不能重置'):
+        await engine.reset(task['id'])
+    engine.start(task['id'], resume=True)
+    await engine.job
+    assert state['submits'] == 1
+    assert store.get(task['id'])['result']['order_id'] == '123456789013'
+
+
+async def test_submit_api_rejection_skips_cashier_timeout_but_never_retries(store, config, mock_shop, browser_harness, tmp_path):
+    state, _ = mock_shop
+    state.update(submitApi=True)
+    context = await browser_harness.ensure()
+    async def submit(route):
+        state['submits'] += 1
+        await route.fulfill(status=200, headers={'Content-Type':'application/json','Access-Control-Allow-Origin':'*'},
+                            body=json.dumps({'success':False,'message':'商品无货'}))
+    await context.route('https://api.m.jd.com/api?*', submit)
+    task, _ = await run_shop(store, config, mock_shop, browser_harness, tmp_path)
+    assert task['status'] == Status.WAITING and state['submits'] == 1
+    assert '接口返回未成功' in task['message']
+    events = store.events(task['id'])
+    payment = next(e for e in events if '提交动作结束' in e['message'])
+    verifying = next(e for e in events if '正在查看订单号' in e['message'])
+    assert (datetime.fromisoformat(verifying['time'])-datetime.fromisoformat(payment['time'])).total_seconds() < 3
+
+
+async def test_submit_api_restriction_does_not_query_orders_again(store, config, mock_shop, browser_harness, tmp_path):
+    state, _ = mock_shop
+    state.update(submitApi=True)
+    context = await browser_harness.ensure()
+    async def submit(route):
+        state['submits'] += 1
+        await route.fulfill(status=429, headers={'Content-Type':'application/json','Access-Control-Allow-Origin':'*'},body='{}')
+    await context.route('https://api.m.jd.com/api?*', submit)
+    task, _ = await run_shop(store, config, mock_shop, browser_harness, tmp_path)
+    assert task['status'] == Status.WAITING and '暂停' in task['message']
+    assert state['submits'] == 1
+    assert not task['result']['order_id']
+
+
+async def test_submit_api_candidate_cannot_match_a_different_new_order(config, browser_harness, tmp_path):
+    adapter = JDAdapter(browser_harness, tmp_path)
+    adapter.expected_order_id = '123456789013'
+    async def orders(*args, **kwargs):
+        return [{'id':'123456789099','skus':{config.product.sku},'quantity':1,'stamp':datetime.now(CHINA),
+                 'total':100,'pending':True}]
+    adapter._orders = orders
+    result = await adapter.verify(config, [])
+    assert result.outcome == 'unknown' and result.order_id == '123456789013'
+
+
+@pytest.mark.parametrize('browser_harness', ['persistent', 'native_cdp'], indirect=True)
+async def test_direct_api_trial_runs_native_fetch_once_in_real_browser(config, mock_shop, browser_harness, tmp_path):
+    from assistant.adapters.jd_api_direct import DirectSubmitTrial, PreparedSubmit
+    state, origin = mock_shop
+    context = await browser_harness.ensure()
+    calls = []
+    intent = []
+    async def submit(route):
+        if route.request.method == 'OPTIONS':
+            await route.fulfill(status=204, headers={'Access-Control-Allow-Origin':origin,
+                'Access-Control-Allow-Credentials':'true', 'Access-Control-Allow-Methods':'POST',
+                'Access-Control-Allow-Headers':'content-type'})
+            return
+        assert intent == ['persisted']
+        calls.append(route.request)
+        await route.fulfill(status=200, headers={'Content-Type':'application/json',
+            'Access-Control-Allow-Origin':origin, 'Access-Control-Allow-Credentials':'true'},
+            body=json.dumps({'success':True,'orderId':'123456789013'}))
+    await context.route('https://api.m.jd.com/api?*', submit)
+    adapter = JDAdapter(browser_harness, tmp_path)
+    adapter.page = await browser_harness.task_page()
+    await adapter.page.goto(origin+'/?stage=checkout')
+    await adapter.page.get_by_test_id('submit-order').wait_for()
+    checkout = await adapter.read_checkout(config)
+    config = config.model_copy(update={'scheduled_at':datetime.now(CHINA)-timedelta(milliseconds=50), 'window_seconds':30})
+    prepared = PreparedSubmit('https://api.m.jd.com/api?functionId=balance_submitOrder_pc',
+                              'fixture-only=1', adapter.page.url, checkout)
+    client = DirectSubmitTrial(browser_harness, adapter.page, lambda:intent.append('persisted'))
+    signal = await client.submit(config, prepared, adapter.read_checkout)
+    assert signal.kind == 'candidate' and signal.order_id == '123456789013'
+    assert len(calls) == 1 and calls[0].post_data == 'fixture-only=1'
+    assert state['submits'] == 0  # The DOM button was never clicked.
+    with pytest.raises(NeedsHuman):
+        await client.submit(config, prepared, adapter.read_checkout)
+    assert len(calls) == 1
